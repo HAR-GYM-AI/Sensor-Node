@@ -31,17 +31,31 @@
 
 // Sampling Configuration
 #define SAMPLING_RATE_HZ 100
-#define SAMPLING_PERIOD_MS 10  // 1000ms / 100Hz = 10ms
+#define SAMPLING_PERIOD_MS 4  // 1000ms / 208Hz ≈ 4.8ms, use 4ms for the software timer
 #define BUFFER_SIZE 20
 
 // IMU Configuration
 #define ACCEL_RANGE 8   // ±8g
 #define GYRO_RANGE 500  // ±500 dps
 
+
+// Sliding Window Configuration
+#define SHORT_WINDOW_SIZE 150      // 1.5s @ 100Hz for classification
+#define SHORT_WINDOW_OVERLAP 0.75  // 75% overlap
+#define SHORT_WINDOW_STEP 38       // 150 * (1 - 0.75) = 37.5 ≈ 38 samples
+#define LONG_WINDOW_SIZE 300       // 3.0s @ 100Hz for rep counting
+#define LONG_WINDOW_OVERLAP 0.5    // 50% overlap
+#define LONG_WINDOW_STEP 150       // 300 * (1 - 0.5) = 150 samples
+
+
+
 // BLE Configuration
 #define SERVICE_UUID        "19B10000-E8F2-537E-4F6C-D104768A1214"
 #define ORIENTATION_CHAR_UUID "19B10001-E8F2-537E-4F6C-D104768A1214"
 #define CONTROL_CHAR_UUID   "19B10002-E8F2-537E-4F6C-D104768A1214"
+#define FEATURES_SHORT_CHAR_UUID "19B10003-E8F2-537E-4F6C-D104768A1214"
+#define FEATURES_LONG_CHAR_UUID  "19B10004-E8F2-537E-4F6C-D104768A1214"
+
 
 // GLOBAL VARIABLES
 
@@ -49,6 +63,8 @@
 BLEService sensorService(SERVICE_UUID);
 BLECharacteristic orientationChar(ORIENTATION_CHAR_UUID, BLERead | BLENotify, 20);
 BLECharacteristic controlChar(CONTROL_CHAR_UUID, BLERead | BLEWrite | BLENotify, 20);
+BLECharacteristic featuresShortChar(FEATURES_SHORT_CHAR_UUID, BLERead | BLENotify, 20);
+BLECharacteristic featuresLongChar(FEATURES_LONG_CHAR_UUID, BLERead | BLENotify, 20);
 
 // Adafruit AHRS Madgwick Filter
 Adafruit_Madgwick filter;
@@ -72,6 +88,45 @@ bool isCalibrated = false;
 // Quaternion Output
 float qw, qx, qy, qz;
 
+// Sliding Window Buffers
+struct QuaternionSample {
+  uint16_t timestamp;
+  float qw, qx, qy, qz;
+};
+
+
+QuaternionSample shortWindowBuffer[SHORT_WINDOW_SIZE];
+QuaternionSample longWindowBuffer[LONG_WINDOW_SIZE];
+uint16_t shortWindowIndex = 0;
+uint16_t longWindowIndex = 0;
+uint16_t shortWindowSampleCount = 0;
+uint16_t longWindowSampleCount = 0;
+uint16_t samplesSinceLastShortWindow = 0;
+uint16_t samplesSinceLastLongWindow = 0;
+
+
+// Feature Extraction Results
+struct WindowFeatures {
+  uint8_t windowType;      // 0=short, 1=long
+  uint8_t nodeId;
+  uint16_t windowId;
+  float qw_mean;
+  float qx_mean;
+  float qy_mean;
+  float qz_mean;
+  float qw_std;
+  float qx_std;
+  float qy_std;
+  float qz_std;
+  float sma;               // Signal Magnitude Area
+  float dominantFreq;      // Dominant frequency component
+};
+
+
+uint16_t shortWindowId = 0;
+uint16_t longWindowId = 0;
+
+
 // Circular Buffer for BLE Recovery
 struct SensorData {
   uint8_t seqNum;
@@ -84,6 +139,7 @@ uint8_t bufferIndex = 0;
 // System State
 bool isRunning = false;
 bool bleConnected = false;
+bool enableWindowing = true;  // Enable/disable windowing mode
 
 // PACKET STRUCTURE
 
@@ -97,6 +153,39 @@ struct OrientationPacket {
   float qz;                // 4 bytes
   // Total: 20 bytes
 };
+
+struct FeaturePacket {
+  uint8_t windowType;      // 1 byte (0=short, 1=long)
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  float qw_mean;           // 4 bytes
+  float qx_mean;           // 4 bytes
+  float qy_mean;           // 4 bytes
+  float qz_mean;           // 4 bytes
+  // Total: 20 bytes (first packet)
+};
+
+struct FeaturePacket2 {
+  uint8_t windowType;      // 1 byte
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  float qw_std;            // 4 bytes
+  float qx_std;            // 4 bytes
+  float qy_std;            // 4 bytes
+  float qz_std;            // 4 bytes
+  // Total: 20 bytes (second packet)
+};
+
+struct FeaturePacket3 {
+  uint8_t windowType;      // 1 byte
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  float sma;               // 4 bytes
+  float dominantFreq;      // 4 bytes
+  uint8_t padding[8];      // 8 bytes padding
+  // Total: 20 bytes (third packet)
+};
+
 
 // SETUP
 
@@ -112,6 +201,19 @@ void setup() {
     Serial.println("========================================");
     Serial.print("Node ID: ");
     Serial.println(NODE_ID);
+    Serial.print(SHORT_WINDOW_SIZE);
+    Serial.print(" samples (");
+    Serial.print(SHORT_WINDOW_SIZE * 10);
+    Serial.print("ms) with ");
+    Serial.print(SHORT_WINDOW_OVERLAP * 100);
+    Serial.println("% overlap");
+    Serial.print("Long Window: ");
+    Serial.print(LONG_WINDOW_SIZE);
+    Serial.print(" samples (");
+    Serial.print(LONG_WINDOW_SIZE * 10);
+    Serial.print("ms) with ");
+    Serial.print(LONG_WINDOW_OVERLAP * 100);
+    Serial.println("% overlap");
   #else
     // In standalone mode, still initialize serial but don't wait
     Serial.begin(115200);
@@ -125,9 +227,16 @@ void setup() {
     #endif
     while (1);
   }
+
   
   #if DEBUG_MODE
     Serial.println("IMU initialized successfully");
+    Serial.print("Accelerometer sample rate = ");
+    Serial.print(IMU.accelerationSampleRate());
+    Serial.println(" Hz");
+    Serial.println();
+    Serial.println("Acceleration in g's");
+    Serial.println("X\tY\tZ");
   #endif
   
   // Initialize Adafruit AHRS Madgwick Filter
@@ -190,6 +299,8 @@ void loop() {
     #endif
     
     while (central.connected()) {
+      BLE.poll();
+
       // Check for control commands
       if (controlChar.written()) {
         handleControlCommand();
@@ -207,8 +318,26 @@ void loop() {
           if (readIMU()) {
             applyCalibration();
             updateOrientation();
-            storeInBuffer();
-            transmitData();
+            if (enableWindowing) {
+              // Add to sliding windows
+              addToWindows();
+              
+              // Check if windows are ready for feature extraction
+              if (samplesSinceLastShortWindow >= SHORT_WINDOW_STEP && shortWindowSampleCount >= SHORT_WINDOW_SIZE) {
+                extractAndTransmitFeatures(0);  // Short window (classification)
+                samplesSinceLastShortWindow = 0;
+                shortWindowId++;
+              }
+              
+              if (samplesSinceLastLongWindow >= LONG_WINDOW_STEP && longWindowSampleCount >= LONG_WINDOW_SIZE) {
+                extractAndTransmitFeatures(1);  // Long window (rep counting)
+                samplesSinceLastLongWindow = 0;
+                longWindowId++;
+              }
+            } else {
+              storeInBuffer();
+              transmitData();
+            }
             
             #if DEBUG_MODE
               // In debug mode, print detailed packet info every 50 samples (0.5 sec)
@@ -255,6 +384,8 @@ void setupBLE() {
   // Add characteristics to service
   sensorService.addCharacteristic(orientationChar);
   sensorService.addCharacteristic(controlChar);
+  sensorService.addCharacteristic(featuresShortChar);
+  sensorService.addCharacteristic(featuresLongChar);
   
   // Add service
   BLE.addService(sensorService);
@@ -319,6 +450,223 @@ void updateOrientation() {
 }
 
 // CALIBRATION
+
+// SLIDING WINDOW FUNCTIONS
+
+void resetWindows() {
+  shortWindowIndex = 0;
+  longWindowIndex = 0;
+  shortWindowSampleCount = 0;
+  longWindowSampleCount = 0;
+  samplesSinceLastShortWindow = 0;
+  samplesSinceLastLongWindow = 0;
+  shortWindowId = 0;
+  longWindowId = 0;
+  
+  #if DEBUG_MODE
+    Serial.println("Sliding windows reset");
+  #endif
+}
+
+void addToWindows() {
+  // Add current quaternion sample to both windows
+  QuaternionSample sample;
+  sample.timestamp = timestamp;
+  sample.qw = qw;
+  sample.qx = qx;
+  sample.qy = qy;
+  sample.qz = qz;
+  
+  // Add to short window (circular buffer)
+  shortWindowBuffer[shortWindowIndex] = sample;
+  shortWindowIndex = (shortWindowIndex + 1) % SHORT_WINDOW_SIZE;
+  if (shortWindowSampleCount < SHORT_WINDOW_SIZE) {
+    shortWindowSampleCount++;
+  }
+  samplesSinceLastShortWindow++;
+  
+  // Add to long window (circular buffer)
+  longWindowBuffer[longWindowIndex] = sample;
+  longWindowIndex = (longWindowIndex + 1) % LONG_WINDOW_SIZE;
+  if (longWindowSampleCount < LONG_WINDOW_SIZE) {
+    longWindowSampleCount++;
+  }
+  samplesSinceLastLongWindow++;
+}
+
+void extractAndTransmitFeatures(uint8_t windowType) {
+  WindowFeatures features;
+  features.windowType = windowType;
+  features.nodeId = NODE_ID;
+  
+  QuaternionSample* buffer;
+  uint16_t windowSize;
+  
+  if (windowType == 0) {
+    // Short window
+    buffer = shortWindowBuffer;
+    windowSize = SHORT_WINDOW_SIZE;
+    features.windowId = shortWindowId;
+  } else {
+    // Long window
+    buffer = longWindowBuffer;
+    windowSize = LONG_WINDOW_SIZE;
+    features.windowId = longWindowId;
+  }
+  
+  // Calculate mean
+  float sum_qw = 0, sum_qx = 0, sum_qy = 0, sum_qz = 0;
+  for (uint16_t i = 0; i < windowSize; i++) {
+    sum_qw += buffer[i].qw;
+    sum_qx += buffer[i].qx;
+    sum_qy += buffer[i].qy;
+    sum_qz += buffer[i].qz;
+  }
+  
+  features.qw_mean = sum_qw / windowSize;
+  features.qx_mean = sum_qx / windowSize;
+  features.qy_mean = sum_qy / windowSize;
+  features.qz_mean = sum_qz / windowSize;
+  
+  // Calculate standard deviation
+  float sum_sq_qw = 0, sum_sq_qx = 0, sum_sq_qy = 0, sum_sq_qz = 0;
+  for (uint16_t i = 0; i < windowSize; i++) {
+    sum_sq_qw += pow(buffer[i].qw - features.qw_mean, 2);
+    sum_sq_qx += pow(buffer[i].qx - features.qx_mean, 2);
+    sum_sq_qy += pow(buffer[i].qy - features.qy_mean, 2);
+    sum_sq_qz += pow(buffer[i].qz - features.qz_mean, 2);
+  }
+  
+  features.qw_std = sqrt(sum_sq_qw / windowSize);
+  features.qx_std = sqrt(sum_sq_qx / windowSize);
+  features.qy_std = sqrt(sum_sq_qy / windowSize);
+  features.qz_std = sqrt(sum_sq_qz / windowSize);
+  
+  // Calculate Signal Magnitude Area (SMA)
+  // SMA = sum of absolute values of all quaternion components
+  features.sma = 0;
+  for (uint16_t i = 0; i < windowSize; i++) {
+    features.sma += abs(buffer[i].qw) + abs(buffer[i].qx) + abs(buffer[i].qy) + abs(buffer[i].qz);
+  }
+  features.sma /= windowSize;
+  
+  // Calculate dominant frequency (simplified FFT alternative)
+  // Using autocorrelation peak detection as a lightweight alternative
+  features.dominantFreq = calculateDominantFrequency(buffer, windowSize);
+  
+  // Transmit features via BLE (split into 3 packets due to 20-byte limit)
+  transmitFeatures(features);
+  
+  #if DEBUG_MODE
+    if (windowType == 0) {
+      Serial.println();
+      Serial.println("=== SHORT WINDOW FEATURES ===");
+    } else {
+      Serial.println();
+      Serial.println("=== LONG WINDOW FEATURES ===");
+    }
+    Serial.print("Window ID: "); Serial.println(features.windowId);
+    Serial.print("Mean: ["); 
+    Serial.print(features.qw_mean, 4); Serial.print(", ");
+    Serial.print(features.qx_mean, 4); Serial.print(", ");
+    Serial.print(features.qy_mean, 4); Serial.print(", ");
+    Serial.print(features.qz_mean, 4); Serial.println("]");
+    Serial.print("Std: [");
+    Serial.print(features.qw_std, 4); Serial.print(", ");
+    Serial.print(features.qx_std, 4); Serial.print(", ");
+    Serial.print(features.qy_std, 4); Serial.print(", ");
+    Serial.print(features.qz_std, 4); Serial.println("]");
+    Serial.print("SMA: "); Serial.println(features.sma, 4);
+    Serial.print("Dominant Freq: "); Serial.print(features.dominantFreq, 2); Serial.println(" Hz");
+    Serial.println("=============================");
+    Serial.println();
+  #endif
+}
+
+float calculateDominantFrequency(QuaternionSample* buffer, uint16_t windowSize) {
+  // Simplified frequency estimation using zero-crossing rate
+  // on the quaternion magnitude changes
+  
+  float prevMagnitude = sqrt(pow(buffer[0].qw, 2) + pow(buffer[0].qx, 2) + 
+                             pow(buffer[0].qy, 2) + pow(buffer[0].qz, 2));
+  int zeroCrossings = 0;
+  
+  for (uint16_t i = 1; i < windowSize; i++) {
+    float magnitude = sqrt(pow(buffer[i].qw, 2) + pow(buffer[i].qx, 2) + 
+                          pow(buffer[i].qy, 2) + pow(buffer[i].qz, 2));
+    
+    float diff = magnitude - prevMagnitude;
+    float prevDiff = prevMagnitude - sqrt(pow(buffer[i > 1 ? i-1 : 0].qw, 2) + 
+                                         pow(buffer[i > 1 ? i-1 : 0].qx, 2) + 
+                                         pow(buffer[i > 1 ? i-1 : 0].qy, 2) + 
+                                         pow(buffer[i > 1 ? i-1 : 0].qz, 2));
+    
+    if ((diff > 0 && prevDiff < 0) || (diff < 0 && prevDiff > 0)) {
+      zeroCrossings++;
+    }
+    
+    prevMagnitude = magnitude;
+  }
+  
+  // Frequency = (zero crossings / 2) / window duration
+  float windowDuration = windowSize / (float)SAMPLING_RATE_HZ;
+  float frequency = (zeroCrossings / 2.0) / windowDuration;
+  
+  return frequency;
+}
+
+void transmitFeatures(WindowFeatures& features) {
+  if (!bleConnected) return;
+  
+  // Packet 1: Means
+  FeaturePacket packet1;
+  packet1.windowType = features.windowType;
+  packet1.nodeId = features.nodeId;
+  packet1.windowId = features.windowId;
+  packet1.qw_mean = features.qw_mean;
+  packet1.qx_mean = features.qx_mean;
+  packet1.qy_mean = features.qy_mean;
+  packet1.qz_mean = features.qz_mean;
+  
+  // Packet 2: Standard Deviations
+  FeaturePacket2 packet2;
+  packet2.windowType = features.windowType;
+  packet2.nodeId = features.nodeId;
+  packet2.windowId = features.windowId;
+  packet2.qw_std = features.qw_std;
+  packet2.qx_std = features.qx_std;
+  packet2.qy_std = features.qy_std;
+  packet2.qz_std = features.qz_std;
+  
+  // Packet 3: SMA and Dominant Frequency
+  FeaturePacket3 packet3;
+  packet3.windowType = features.windowType;
+  packet3.nodeId = features.nodeId;
+  packet3.windowId = features.windowId;
+  packet3.sma = features.sma;
+  packet3.dominantFreq = features.dominantFreq;
+  memset(packet3.padding, 0, 8);
+  
+  // Send via appropriate BLE characteristic
+  if (features.windowType == 0) {
+    // Short window (classification)
+    featuresShortChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
+    delay(2);  // Small delay between packets
+    featuresShortChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
+    delay(2);
+    featuresShortChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
+  } else {
+    // Long window (rep counting)
+    featuresLongChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
+    delay(2);
+    featuresLongChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
+    delay(2);
+    featuresLongChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
+  }
+}
+
+
+
 
 void performGyroCalibration() {
   #if DEBUG_MODE
@@ -475,6 +823,9 @@ void handleControlCommand() {
     case 0x06:  // Sync Time
       handleTimeSyncCommand(command, len);
       break;
+    case 0x07:
+      handleToggleWindowingCommand();
+      break;
       
     case 0xFF:  // Heartbeat/Ping
       handleHeartbeat();
@@ -580,6 +931,21 @@ void handleTimeSyncCommand(uint8_t* command, int len) {
   sendAck(0x06, 0x00);  // ACK
 }
 
+void handleToggleWindowingCommand() {
+  enableWindowing = !enableWindowing;
+  
+  #if DEBUG_MODE
+    Serial.print(">>> Windowing mode: ");
+    Serial.println(enableWindowing ? "ENABLED" : "DISABLED (raw mode)");
+  #endif
+  
+  if (enableWindowing) {
+    resetWindows();
+  }
+  
+  sendAck(0x07, 0x00);  // ACK
+}
+
 void handleHeartbeat() {
   // Respond to heartbeat/ping
   uint8_t response[6];
@@ -627,6 +993,24 @@ void printQuaternion() {
 
 // DEBUG MODE UTILITY FUNCTIONS so that we can test without PI
 #if DEBUG_MODE
+
+void printWindowStatus() {
+  Serial.println();
+  Serial.println("--- Window Status ---");
+  Serial.print("Short Window: "); Serial.print(shortWindowSampleCount);
+  Serial.print("/"); Serial.print(SHORT_WINDOW_SIZE);
+  Serial.print(" | Samples since last: "); Serial.println(samplesSinceLastShortWindow);
+  Serial.print("Long Window: "); Serial.print(longWindowSampleCount);
+  Serial.print("/"); Serial.print(LONG_WINDOW_SIZE);
+  Serial.print(" | Samples since last: "); Serial.println(samplesSinceLastLongWindow);
+  Serial.print("Short Window ID: "); Serial.println(shortWindowId);
+  Serial.print("Long Window ID: "); Serial.println(longWindowId);
+  Serial.print("Uptime: "); Serial.print(millis() - systemStartTime); Serial.println(" ms");
+  Serial.println("---------------------");
+  Serial.println();
+}
+
+
 void printDetailedPacketInfo() {
   Serial.println();
   Serial.println("--- Packet Details ---");
@@ -761,7 +1145,7 @@ void printDebugMenu() {
   Serial.println("DEBUG MENU");
   Serial.println("Send commands via Serial Monitor:");
   Serial.println("  '1' - Print status");
-  Serial.println("  '2' - Test packet structure");
+  Serial.println("  '2' - Print Window Status");
   Serial.println("  '3' - Calibrate gyroscope");
   Serial.println("  '4' - Print current IMU reading");
   Serial.println("  '5' - Print current quaternion");
@@ -787,7 +1171,7 @@ void handleSerialCommand() {
         break;
         
       case '2':
-        testPacketStructure();
+        printWindowStatus();
         break;
         
       case '3':
