@@ -28,6 +28,8 @@
 
 // Node Configuration - CHANGE THIS FOR EACH DEVICE
 #define NODE_ID 1  // 0=Wrist, 1=Bicep, 2=Chest, 3=Thigh
+// Placement names for BLE advertising
+const char* PLACEMENT_NAMES[] = {"Wrist", "Bicep", "Chest", "Thigh"};
 
 // Sampling Configuration
 #define SAMPLING_RATE_HZ 100
@@ -374,22 +376,35 @@ void loop() {
 
 void setupBLE() {
   // Set device name
-  String deviceName = "HAR_Node_" + String(NODE_ID);
+  String deviceName = "HAR_Node_" + String(PLACEMENT_NAMES[NODE_ID]);
   BLE.setLocalName(deviceName.c_str());
   BLE.setDeviceName(deviceName.c_str());
   
-  // Set advertised service
-  BLE.setAdvertisedService(sensorService);
+
+    //descriptors to make characteristics show readable names in nRF Connect
+  BLEDescriptor orientationDescriptor("2901", "Orientation Data");
+  orientationChar.addDescriptor(orientationDescriptor);
+  
+  BLEDescriptor controlDescriptor("2901", "Control Channel");
+  controlChar.addDescriptor(controlDescriptor);
+  
+  BLEDescriptor featuresShortDescriptor("2901", "Features Short Window");
+  featuresShortChar.addDescriptor(featuresShortDescriptor);
+  
+  BLEDescriptor featuresLongDescriptor("2901", "Features Long Window");
+  featuresLongChar.addDescriptor(featuresLongDescriptor);
   
   // Add characteristics to service
   sensorService.addCharacteristic(orientationChar);
   sensorService.addCharacteristic(controlChar);
   sensorService.addCharacteristic(featuresShortChar);
   sensorService.addCharacteristic(featuresLongChar);
+
   
   // Add service
   BLE.addService(sensorService);
-  
+    // Set advertised service
+  BLE.setAdvertisedService(sensorService);
   // Start advertising
   BLE.advertise();
   
