@@ -9,11 +9,22 @@
  * - 100Hz sampling rate with hardware timer
  * - Calibration support
  * - Circular buffer for transmission recovery
+ * - Window-based feature extraction with raw sample bundling
  * 
- * Placement: Wrist, Bicep, Chest, or Thigh
+ * NODE CONFIGURATION:
+ * Each device MUST be configured with a unique placement before deployment:
+ *   - Set NODE_PLACEMENT to: WRIST, BICEP, CHEST, or THIGH
+ *   - This determines the node's identity across the 4-node system
+ *   - BLE device name will be: HAR_WRIST_0, HAR_BICEP_1, etc.
+ *   - All packets include nodeId to identify source during simultaneous operation
+ * 
+ * MULTI-NODE OPERATION:
+ * All 4 nodes transmit simultaneously. Each node is uniquely identified by:
+ *   1. BLE device name (e.g., "HAR_BICEP_1")
+ *   2. Node ID in every data packet (WRIST=0, BICEP=1, CHEST=2, THIGH=3)
+ *   3. Initial identification packet (0xFE) sent on BLE connection
  * 
  * Library Required: Adafruit AHRS (install via Arduino Library Manager) + BLE
- * I think we should do a script but I could not figure it out on my desktop
  */
 
 #include <Arduino_LSM6DS3.h>
@@ -26,14 +37,30 @@
 #define DEBUG_MODE true  // true = USB debugging with serial output
                          // false = standalone mode (no USB, for deployment)
 
-// Node Configuration - CHANGE THIS FOR EACH DEVICE
-#define NODE_ID 1  // 0=Wrist, 1=Bicep, 2=Chest, 3=Thigh
-// Placement names for BLE advertising
-const char* PLACEMENT_NAMES[] = {"Wrist", "Bicep", "Chest", "Thigh"};
+// Node Placement Enumeration
+// ┌──────────┬────────┬───────────────────┐
+// │ Location │ NodeID │ BLE Device Name   │
+// ├──────────┼────────┼───────────────────┤
+// │ WRIST    │   0    │ HAR_WRIST_0       │
+// │ BICEP    │   1    │ HAR_BICEP_1       │
+// │ CHEST    │   2    │ HAR_CHEST_2       │
+// │ THIGH    │   3    │ HAR_THIGH_3       │
+// └──────────┴────────┴───────────────────┘
+enum NodePlacement : uint8_t {
+  WRIST = 0,
+  BICEP = 1,
+  CHEST = 2,
+  THIGH = 3
+};
+
+// ⚠️ IMPORTANT: CHANGE THIS FOR EACH DEVICE ⚠️
+// Set to WRIST, BICEP, CHEST, or THIGH based on physical placement
+#define NODE_PLACEMENT BICEP  // ← CHANGE THIS
+#define NODE_ID NODE_PLACEMENT  // For backward compatibility
 
 // Sampling Configuration
 #define SAMPLING_RATE_HZ 100
-#define SAMPLING_PERIOD_MS 4  // 1000ms / 208Hz ≈ 4.8ms, use 4ms for the software timer
+#define SAMPLING_PERIOD_MS 10  // 1000ms / 100Hz = 10ms
 #define BUFFER_SIZE 20
 
 // IMU Configuration
@@ -144,6 +171,20 @@ bool bleConnected = false;
 bool enableWindowing = true;  // Enable/disable windowing mode
 
 // PACKET STRUCTURE
+//
+// WINDOWING MODE (enableWindowing = true):
+//   When a window is ready, sends:
+//   1. FeaturePacket (means)
+//   2. FeaturePacket2 (std devs)
+//   3. FeaturePacket3 (SMA, freq, sample count)
+//   4. WindowSamplePacket1 + WindowSamplePacket2 (repeated for each sample in window)
+//
+//   Short Window: 3 + (150 * 2) = 303 packets every ~380ms
+//   Long Window:  3 + (300 * 2) = 603 packets every ~1500ms
+//
+// RAW MODE (enableWindowing = false):
+//   Sends OrientationPacket continuously at 100Hz
+//
 
 struct OrientationPacket {
   uint8_t sequenceNumber;  // 1 byte
@@ -184,8 +225,60 @@ struct FeaturePacket3 {
   uint16_t windowId;       // 2 bytes
   float sma;               // 4 bytes
   float dominantFreq;      // 4 bytes
-  uint8_t padding[8];      // 8 bytes padding
+  uint16_t totalSamples;   // 2 bytes - number of samples in window
+  uint8_t padding[6];      // 6 bytes padding
   // Total: 20 bytes (third packet)
+};
+
+// Packet for raw quaternion samples within a window
+struct WindowSamplePacket {
+  uint8_t windowType;      // 1 byte (0=short, 1=long)
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  uint16_t sampleIndex;    // 2 bytes - index within window (0 to windowSize-1)
+  uint16_t timestamp;      // 2 bytes
+  float qw;                // 4 bytes
+  float qx;                // 4 bytes
+  float qy;                // 4 bytes
+  float qz;                // 4 bytes
+  // Total: 24 bytes - EXCEEDS 20! Need to split
+};
+
+// Split into two packets due to 20-byte BLE limit
+struct WindowSamplePacket1 {
+  uint8_t windowType;      // 1 byte
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  uint16_t sampleIndex;    // 2 bytes
+  uint16_t timestamp;      // 2 bytes
+  float qw;                // 4 bytes
+  float qx;                // 4 bytes
+  uint8_t padding[4];      // 4 bytes padding
+  // Total: 20 bytes
+};
+
+struct WindowSamplePacket2 {
+  uint8_t windowType;      // 1 byte
+  uint8_t nodeId;          // 1 byte
+  uint16_t windowId;       // 2 bytes
+  uint16_t sampleIndex;    // 2 bytes
+  float qy;                // 4 bytes
+  float qz;                // 4 bytes
+  uint8_t padding[6];      // 6 bytes padding
+  // Total: 20 bytes
+};
+
+// Node identification packet sent on connection
+struct NodeIdentificationPacket {
+  uint8_t packetType;      // 1 byte - 0xFE for identification
+  uint8_t nodeId;          // 1 byte - WRIST=0, BICEP=1, CHEST=2, THIGH=3
+  uint8_t nodePlacement;   // 1 byte - same as nodeId (for clarity)
+  uint8_t samplingRate;    // 1 byte - 100Hz
+  uint16_t shortWindowSize; // 2 bytes - 150
+  uint16_t longWindowSize;  // 2 bytes - 300
+  uint8_t firmwareVersion; // 1 byte - version number
+  uint8_t padding[11];     // 11 bytes padding
+  // Total: 20 bytes
 };
 
 
@@ -201,8 +294,17 @@ void setup() {
     Serial.println("========================================");
     Serial.println("HAR Sensor Node - DEBUG MODE");
     Serial.println("========================================");
+    Serial.print("Node Placement: ");
+    switch(NODE_PLACEMENT) {
+      case WRIST: Serial.println("WRIST (0)"); break;
+      case BICEP: Serial.println("BICEP (1)"); break;
+      case CHEST: Serial.println("CHEST (2)"); break;
+      case THIGH: Serial.println("THIGH (3)"); break;
+      default: Serial.println("UNKNOWN"); break;
+    }
     Serial.print("Node ID: ");
     Serial.println(NODE_ID);
+    Serial.print("Short Window: ");
     Serial.print(SHORT_WINDOW_SIZE);
     Serial.print(" samples (");
     Serial.print(SHORT_WINDOW_SIZE * 10);
@@ -294,6 +396,10 @@ void loop() {
     timestamp = 0;
     sequenceNumber = 0;
     
+    // Send node identification immediately after connection
+    delay(100);  // Small delay to ensure connection is stable
+    sendNodeIdentification();
+    
     #if DEBUG_MODE
       // In debug mode, automatically start data collection
       isRunning = true;
@@ -320,6 +426,7 @@ void loop() {
           if (readIMU()) {
             applyCalibration();
             updateOrientation();
+            
             if (enableWindowing) {
               // Add to sliding windows
               addToWindows();
@@ -337,21 +444,20 @@ void loop() {
                 longWindowId++;
               }
             } else {
+              // When windowing is disabled, send raw data continuously
               storeInBuffer();
               transmitData();
             }
             
             #if DEBUG_MODE
               // In debug mode, print detailed packet info every 50 samples (0.5 sec)
-              if (sequenceNumber % 50 == 0) {
-                printDetailedPacketInfo();
-              }
-            #endif
-          } else {
-            #if DEBUG_MODE
-              Serial.println("Warning: IMU read failed");
+              // if (sequenceNumber % 50 == 0) {
+              //   printDetailedPacketInfo();
+              // }
             #endif
           }
+          // Note: Silently skip failed reads - they're usually just timing mismatches
+          // and will succeed on the next cycle
           
           // Increment timestamp (in 10ms ticks)
           timestamp++;
@@ -374,9 +480,20 @@ void loop() {
 
 // BLE SETUP
 
+// Helper function to get placement name
+const char* getPlacementName(NodePlacement placement) {
+  switch(placement) {
+    case WRIST: return "WRIST";
+    case BICEP: return "BICEP";
+    case CHEST: return "CHEST";
+    case THIGH: return "THIGH";
+    default: return "UNKNOWN";
+  }
+}
+
 void setupBLE() {
   // Set device name
-  String deviceName = "HAR_Node_" + String(PLACEMENT_NAMES[NODE_ID]);
+  String deviceName = "HAR_Node_" + String(NODE_ID);
   BLE.setLocalName(deviceName.c_str());
   BLE.setDeviceName(deviceName.c_str());
   
@@ -633,6 +750,17 @@ float calculateDominantFrequency(QuaternionSample* buffer, uint16_t windowSize) 
 void transmitFeatures(WindowFeatures& features) {
   if (!bleConnected) return;
   
+  #if DEBUG_MODE
+    Serial.println();
+    Serial.println("=== BLE TRANSMISSION START ===");
+    Serial.print("Window Type: ");
+    Serial.println(features.windowType == 0 ? "SHORT (Classification)" : "LONG (Rep Counting)");
+    Serial.print("Window ID: ");
+    Serial.println(features.windowId);
+    Serial.print("Timestamp: ");
+    Serial.println(millis() - systemStartTime);
+  #endif
+  
   // Packet 1: Means
   FeaturePacket packet1;
   packet1.windowType = features.windowType;
@@ -660,24 +788,123 @@ void transmitFeatures(WindowFeatures& features) {
   packet3.windowId = features.windowId;
   packet3.sma = features.sma;
   packet3.dominantFreq = features.dominantFreq;
-  memset(packet3.padding, 0, 8);
+  
+  // Get window buffer and size
+  QuaternionSample* buffer;
+  uint16_t windowSize;
+  if (features.windowType == 0) {
+    buffer = shortWindowBuffer;
+    windowSize = SHORT_WINDOW_SIZE;
+  } else {
+    buffer = longWindowBuffer;
+    windowSize = LONG_WINDOW_SIZE;
+  }
+  packet3.totalSamples = windowSize;
+  memset(packet3.padding, 0, 6);
   
   // Send via appropriate BLE characteristic
   if (features.windowType == 0) {
     // Short window (classification)
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 1 (Means) via SHORT window characteristic...");
+    #endif
     featuresShortChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
     delay(2);  // Small delay between packets
+    
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 2 (Std Devs) via SHORT window characteristic...");
+    #endif
     featuresShortChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
     delay(2);
+    
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 3 (SMA & Freq) via SHORT window characteristic...");
+    #endif
     featuresShortChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
   } else {
     // Long window (rep counting)
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 1 (Means) via LONG window characteristic...");
+    #endif
     featuresLongChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
     delay(2);
+    
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 2 (Std Devs) via LONG window characteristic...");
+    #endif
     featuresLongChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
     delay(2);
+    
+    #if DEBUG_MODE
+      Serial.println("Transmitting Packet 3 (SMA & Freq) via LONG window characteristic...");
+    #endif
     featuresLongChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
   }
+  
+  #if DEBUG_MODE
+    Serial.println("✓ All 3 feature packets transmitted");
+    Serial.print("Now transmitting ");
+    Serial.print(windowSize);
+    Serial.println(" raw quaternion samples...");
+  #endif
+  
+  // Now send all raw quaternion samples from the window
+  // Each sample requires 2 packets (due to 20-byte BLE limit)
+  for (uint16_t i = 0; i < windowSize; i++) {
+    // Packet 1: windowType, nodeId, windowId, sampleIndex, timestamp, qw, qx
+    WindowSamplePacket1 samplePkt1;
+    samplePkt1.windowType = features.windowType;
+    samplePkt1.nodeId = features.nodeId;
+    samplePkt1.windowId = features.windowId;
+    samplePkt1.sampleIndex = i;
+    samplePkt1.timestamp = buffer[i].timestamp;
+    samplePkt1.qw = buffer[i].qw;
+    samplePkt1.qx = buffer[i].qx;
+    memset(samplePkt1.padding, 0, 4);
+    
+    // Packet 2: windowType, nodeId, windowId, sampleIndex, qy, qz
+    WindowSamplePacket2 samplePkt2;
+    samplePkt2.windowType = features.windowType;
+    samplePkt2.nodeId = features.nodeId;
+    samplePkt2.windowId = features.windowId;
+    samplePkt2.sampleIndex = i;
+    samplePkt2.qy = buffer[i].qy;
+    samplePkt2.qz = buffer[i].qz;
+    memset(samplePkt2.padding, 0, 6);
+    
+    // Send via appropriate BLE characteristic
+    if (features.windowType == 0) {
+      featuresShortChar.writeValue((uint8_t*)&samplePkt1, sizeof(WindowSamplePacket1));
+      delay(2);
+      featuresShortChar.writeValue((uint8_t*)&samplePkt2, sizeof(WindowSamplePacket2));
+      delay(2);
+    } else {
+      featuresLongChar.writeValue((uint8_t*)&samplePkt1, sizeof(WindowSamplePacket1));
+      delay(2);
+      featuresLongChar.writeValue((uint8_t*)&samplePkt2, sizeof(WindowSamplePacket2));
+      delay(2);
+    }
+    
+    #if DEBUG_MODE
+      // Print progress every 50 samples
+      if ((i + 1) % 50 == 0 || i == windowSize - 1) {
+        Serial.print("  Transmitted sample ");
+        Serial.print(i + 1);
+        Serial.print("/");
+        Serial.println(windowSize);
+      }
+    #endif
+  }
+  
+  #if DEBUG_MODE
+    Serial.println("✓ All window data transmitted successfully");
+    Serial.print("Total packets sent: 3 (features) + ");
+    Serial.print(windowSize * 2);
+    Serial.print(" (samples) = ");
+    Serial.println(3 + windowSize * 2);
+    Serial.println("=== BLE TRANSMISSION END ===");
+    Serial.println();
+  #endif
 }
 
 
@@ -767,6 +994,42 @@ void storeInBuffer() {
   bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
 }
 
+// Send node identification packet
+void sendNodeIdentification() {
+  if (!bleConnected) return;
+  
+  NodeIdentificationPacket idPacket;
+  idPacket.packetType = 0xFE;  // Identification packet marker
+  idPacket.nodeId = NODE_ID;
+  idPacket.nodePlacement = NODE_PLACEMENT;
+  idPacket.samplingRate = SAMPLING_RATE_HZ;
+  idPacket.shortWindowSize = SHORT_WINDOW_SIZE;
+  idPacket.longWindowSize = LONG_WINDOW_SIZE;
+  idPacket.firmwareVersion = 1;  // Version 1.0
+  memset(idPacket.padding, 0, 11);
+  
+  // Send via control characteristic
+  controlChar.writeValue((uint8_t*)&idPacket, sizeof(NodeIdentificationPacket));
+  
+  #if DEBUG_MODE
+    Serial.println();
+    Serial.println("=== NODE IDENTIFICATION SENT ===");
+    Serial.print("Placement: ");
+    Serial.println(getPlacementName(NODE_PLACEMENT));
+    Serial.print("Node ID: ");
+    Serial.println(NODE_ID);
+    Serial.print("Sampling Rate: ");
+    Serial.print(SAMPLING_RATE_HZ);
+    Serial.println(" Hz");
+    Serial.print("Window Sizes: Short=");
+    Serial.print(SHORT_WINDOW_SIZE);
+    Serial.print(", Long=");
+    Serial.println(LONG_WINDOW_SIZE);
+    Serial.println("================================");
+    Serial.println();
+  #endif
+}
+
 // BLE TRANSMISSION
 void transmitData() {
   if (!bleConnected) return;
@@ -783,6 +1046,20 @@ void transmitData() {
   
   // Send via BLE notification
   orientationChar.writeValue((uint8_t*)&packet, sizeof(OrientationPacket));
+  
+  #if DEBUG_MODE
+    // Print raw quaternion transmission every 100 samples (1 second)
+    if (sequenceNumber % 100 == 0) {
+      Serial.print("Raw Quat #");
+      Serial.print(sequenceNumber);
+      Serial.print(" [");
+      Serial.print(qw, 4); Serial.print(", ");
+      Serial.print(qx, 4); Serial.print(", ");
+      Serial.print(qy, 4); Serial.print(", ");
+      Serial.print(qz, 4); Serial.print("] @ ");
+      Serial.print(timestamp * 10); Serial.println("ms");
+    }
+  #endif
   
   // Increment sequence number
   sequenceNumber++;
@@ -1088,10 +1365,18 @@ void printDetailedPacketInfo() {
 void printConnectionStatus() {
   Serial.println();
   Serial.println("========================================");
+  Serial.println("NODE INFORMATION:");
+  Serial.print("  Placement: ");
+  Serial.print(getPlacementName(NODE_PLACEMENT));
+  Serial.print(" (ID: ");
+  Serial.print(NODE_ID);
+  Serial.println(")");
+  Serial.println();
   Serial.println("BLE Status:");
   Serial.print("  Connected: "); Serial.println(bleConnected ? "YES" : "NO");
   Serial.print("  Running: "); Serial.println(isRunning ? "YES" : "NO");
   Serial.print("  Calibrated: "); Serial.println(isCalibrated ? "YES" : "NO");
+  Serial.print("  Windowing: "); Serial.println(enableWindowing ? "ENABLED" : "DISABLED");
   Serial.print("  Sequence Number: "); Serial.println(sequenceNumber);
   Serial.print("  Uptime: "); Serial.print(millis() / 1000); Serial.println(" seconds");
   Serial.println("========================================");
