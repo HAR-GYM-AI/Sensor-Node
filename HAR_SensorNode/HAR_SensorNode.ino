@@ -53,7 +53,7 @@ enum NodePlacement : uint8_t {
   THIGH = 3
 };
 
-// ⚠️ IMPORTANT: CHANGE THIS FOR EACH DEVICE ⚠️
+// IMPORTANT: CHANGE THIS FOR EACH DEVICE 
 // Set to WRIST, BICEP, CHEST, or THIGH based on physical placement
 #define NODE_PLACEMENT BICEP  // ← CHANGE THIS
 #define NODE_ID NODE_PLACEMENT  // For backward compatibility
@@ -84,6 +84,13 @@ enum NodePlacement : uint8_t {
 #define CONTROL_CHAR_UUID   "19B10002-E8F2-537E-4F6C-D104768A1214"
 #define FEATURES_SHORT_CHAR_UUID "19B10003-E8F2-537E-4F6C-D104768A1214"
 #define FEATURES_LONG_CHAR_UUID  "19B10004-E8F2-537E-4F6C-D104768A1214"
+
+// Packet Type Constants
+#define PKT_TYPE_FEATURES_1 0x11
+#define PKT_TYPE_FEATURES_2 0x12
+#define PKT_TYPE_FEATURES_3 0x13
+#define PKT_TYPE_SAMPLE_1   0x21
+#define PKT_TYPE_SAMPLE_2   0x22
 
 
 // GLOBAL VARIABLES
@@ -198,17 +205,20 @@ struct OrientationPacket {
 };
 
 struct FeaturePacket {
-  uint8_t windowType;      // 1 byte (0=short, 1=long)
+  uint8_t packetType;      //e.g., PKT_TYPE_FEATURES_1
+  uint8_t windowType;      // 0=short, 1=long
   uint8_t nodeId;          // 1 byte
   uint16_t windowId;       // 2 bytes
   float qw_mean;           // 4 bytes
   float qx_mean;           // 4 bytes
   float qy_mean;           // 4 bytes
   float qz_mean;           // 4 bytes
+  uint8_t padding[1];      // 1 byte padding to keep total 20 bytes
   // Total: 20 bytes (first packet)
 };
 
 struct FeaturePacket2 {
+  uint8_t packetType;      // e.g., PKT_TYPE_FEATURES_2
   uint8_t windowType;      // 1 byte
   uint8_t nodeId;          // 1 byte
   uint16_t windowId;       // 2 bytes
@@ -216,17 +226,19 @@ struct FeaturePacket2 {
   float qx_std;            // 4 bytes
   float qy_std;            // 4 bytes
   float qz_std;            // 4 bytes
+  uint8_t padding[1];      // 1 byte padding to keep total 20 bytes
   // Total: 20 bytes (second packet)
 };
 
 struct FeaturePacket3 {
+  uint8_t packetType;      // e.g., PKT_TYPE_FEATURES_3
   uint8_t windowType;      // 1 byte
   uint8_t nodeId;          // 1 byte
   uint16_t windowId;       // 2 bytes
   float sma;               // 4 bytes
   float dominantFreq;      // 4 bytes
   uint16_t totalSamples;   // 2 bytes - number of samples in window
-  uint8_t padding[6];      // 6 bytes padding
+  uint8_t padding[5];      // 5 bytes padding to keep total 20 bytes
   // Total: 20 bytes (third packet)
 };
 
@@ -246,6 +258,7 @@ struct WindowSamplePacket {
 
 // Split into two packets due to 20-byte BLE limit
 struct WindowSamplePacket1 {
+  uint8_t packetType;      // PKT_TYPE_SAMPLE_1
   uint8_t windowType;      // 1 byte
   uint8_t nodeId;          // 1 byte
   uint16_t windowId;       // 2 bytes
@@ -253,18 +266,19 @@ struct WindowSamplePacket1 {
   uint16_t timestamp;      // 2 bytes
   float qw;                // 4 bytes
   float qx;                // 4 bytes
-  uint8_t padding[4];      // 4 bytes padding
+  uint8_t padding[3];      // 3 bytes padding to keep total 20 bytes
   // Total: 20 bytes
 };
 
 struct WindowSamplePacket2 {
+  uint8_t packetType;      //PKT_TYPE_SAMPLE_2
   uint8_t windowType;      // 1 byte
   uint8_t nodeId;          // 1 byte
   uint16_t windowId;       // 2 bytes
   uint16_t sampleIndex;    // 2 bytes
   float qy;                // 4 bytes
   float qz;                // 4 bytes
-  uint8_t padding[6];      // 6 bytes padding
+  uint8_t padding[5];      // 5 bytes padding to keep total 20 bytes
   // Total: 20 bytes
 };
 
@@ -492,8 +506,12 @@ const char* getPlacementName(NodePlacement placement) {
 }
 
 void setupBLE() {
-  // Set device name
-  String deviceName = "HAR_Node_" + String(NODE_ID);
+  // Set device name with placement identifier
+  String deviceName = "HAR_";
+  deviceName += getPlacementName(NODE_PLACEMENT);
+  deviceName += "_";
+  deviceName += String(NODE_ID);
+  
   BLE.setLocalName(deviceName.c_str());
   BLE.setDeviceName(deviceName.c_str());
   
@@ -763,6 +781,7 @@ void transmitFeatures(WindowFeatures& features) {
   
   // Packet 1: Means
   FeaturePacket packet1;
+  packet1.packetType = PKT_TYPE_FEATURES_1; // **SET THE TYPE**
   packet1.windowType = features.windowType;
   packet1.nodeId = features.nodeId;
   packet1.windowId = features.windowId;
@@ -770,9 +789,11 @@ void transmitFeatures(WindowFeatures& features) {
   packet1.qx_mean = features.qx_mean;
   packet1.qy_mean = features.qy_mean;
   packet1.qz_mean = features.qz_mean;
+  memset(packet1.padding, 0, 1);
   
   // Packet 2: Standard Deviations
   FeaturePacket2 packet2;
+  packet2.packetType = PKT_TYPE_FEATURES_2; // **SET THE TYPE**
   packet2.windowType = features.windowType;
   packet2.nodeId = features.nodeId;
   packet2.windowId = features.windowId;
@@ -780,9 +801,11 @@ void transmitFeatures(WindowFeatures& features) {
   packet2.qx_std = features.qx_std;
   packet2.qy_std = features.qy_std;
   packet2.qz_std = features.qz_std;
+  memset(packet2.padding, 0, 1);
   
   // Packet 3: SMA and Dominant Frequency
   FeaturePacket3 packet3;
+  packet3.packetType = PKT_TYPE_FEATURES_3; // **SET THE TYPE**
   packet3.windowType = features.windowType;
   packet3.nodeId = features.nodeId;
   packet3.windowId = features.windowId;
@@ -800,7 +823,7 @@ void transmitFeatures(WindowFeatures& features) {
     windowSize = LONG_WINDOW_SIZE;
   }
   packet3.totalSamples = windowSize;
-  memset(packet3.padding, 0, 6);
+  memset(packet3.padding, 0, 5);
   
   // Send via appropriate BLE characteristic
   if (features.windowType == 0) {
@@ -853,6 +876,7 @@ void transmitFeatures(WindowFeatures& features) {
   for (uint16_t i = 0; i < windowSize; i++) {
     // Packet 1: windowType, nodeId, windowId, sampleIndex, timestamp, qw, qx
     WindowSamplePacket1 samplePkt1;
+    samplePkt1.packetType = PKT_TYPE_SAMPLE_1; // **SET THE TYPE**
     samplePkt1.windowType = features.windowType;
     samplePkt1.nodeId = features.nodeId;
     samplePkt1.windowId = features.windowId;
@@ -860,17 +884,18 @@ void transmitFeatures(WindowFeatures& features) {
     samplePkt1.timestamp = buffer[i].timestamp;
     samplePkt1.qw = buffer[i].qw;
     samplePkt1.qx = buffer[i].qx;
-    memset(samplePkt1.padding, 0, 4);
+    memset(samplePkt1.padding, 0, 3);
     
     // Packet 2: windowType, nodeId, windowId, sampleIndex, qy, qz
     WindowSamplePacket2 samplePkt2;
+    samplePkt2.packetType = PKT_TYPE_SAMPLE_2; // **SET THE TYPE**
     samplePkt2.windowType = features.windowType;
     samplePkt2.nodeId = features.nodeId;
     samplePkt2.windowId = features.windowId;
     samplePkt2.sampleIndex = i;
     samplePkt2.qy = buffer[i].qy;
     samplePkt2.qz = buffer[i].qz;
-    memset(samplePkt2.padding, 0, 6);
+    memset(samplePkt2.padding, 0, 5);
     
     // Send via appropriate BLE characteristic
     if (features.windowType == 0) {
