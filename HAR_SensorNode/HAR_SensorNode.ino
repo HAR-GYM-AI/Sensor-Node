@@ -38,7 +38,7 @@
 // CONFIG
 
 // OPERATING MODE - CHANGE THIS FOR TESTING vs DEPLOYMENT
-#define DEBUG_MODE true  // true = USB debugging with serial output
+#define DEBUG_MODE false  // true = USB debugging with serial output
                          // false = standalone mode (no USB, for deployment)
 
 // Node Placement Enumeration
@@ -59,7 +59,7 @@ enum NodePlacement : uint8_t {
 
 // IMPORTANT: CHANGE THIS FOR EACH DEVICE 
 // Set to WRIST, BICEP, CHEST, or THIGH based on physical placement
-#define NODE_PLACEMENT BICEP  // ← CHANGE THIS
+#define NODE_PLACEMENT WRIST  // ← CHANGE THIS
 #define NODE_ID NODE_PLACEMENT  // For backward compatibility
 
 // Sampling Configuration
@@ -101,8 +101,9 @@ Adafruit_Madgwick filter;
 // Timing
 unsigned long lastSampleTime = 0;
 unsigned long systemStartTime = 0;
-uint16_t timestamp = 0;  // 2-byte timestamp in 10ms ticks
+uint32_t timestamp = 0;  // 4-byte relative timestamp in ms
 uint8_t sequenceNumber = 0;
+unsigned long sessionStartTime = 0; // Time sync reference
 
 // Synchronized timing (for multi-node coordination)
 uint32_t syncedTimestampMs = 0;  // RPI reference timestamp in milliseconds
@@ -401,17 +402,20 @@ void monitorBLEQueue() {
 //   Sends OrientationPacket continuously at 100Hz
 //   Windowing is maintained in buffers for RPI-side processing
 //
+// NEW PACKET FORMAT (14 bytes):
+//   - Uses a 4-byte timestamp for millisecond precision
+//   - Compresses quaternion floats into 16-bit integers (quantization)
+//
 
 struct OrientationPacket {
   uint8_t sequenceNumber;  // 1 byte
   uint8_t nodeId;          // 1 byte
-  uint16_t timestamp;      // 2 bytes (10ms ticks, for backward compatibility)
-  float qw;                // 4 bytes
-  float qx;                // 4 bytes
-  float qy;                // 4 bytes
-  float qz;                // 4 bytes
-  // Total: 20 bytes
-  // Note: Synchronized timestamp (ms) can be calculated from timestamp and sync reference
+  uint32_t timestamp;      // 4 bytes (relative timestamp in ms)
+  int16_t qw;              // 2 bytes (quantized)
+  int16_t qx;              // 2 bytes (quantized)
+  int16_t qy;              // 2 bytes (quantized)
+  int16_t qz;              // 2 bytes (quantized)
+  // Total: 14 bytes
 };
 
 // Node identification packet sent on connection
@@ -663,8 +667,8 @@ void loop() {
           // Note: Silently skip failed reads - they're usually just timing mismatches
           // and will succeed on the next cycle
           
-          // Increment timestamp (in 10ms ticks)
-          timestamp++;
+          // Increment timestamp (relative ms)
+          timestamp = millis() - sessionStartTime;
         }
       }
     }
@@ -989,19 +993,35 @@ void sendNodeIdentification() {
 // BLE TRANSMISSION
 void transmitData() {
   if (!bleConnected) return;
+
+  // 1. Get the relative timestamp (full 4 bytes)
+  unsigned long relativeTimestamp = millis() - sessionStartTime;
+
+  // 2. Quantize quaternion floats to 16-bit integers
+  int16_t qw_q = (int16_t)(qw * 32767.0f);
+  int16_t qx_q = (int16_t)(qx * 32767.0f);
+  int16_t qy_q = (int16_t)(qy * 32767.0f);
+  int16_t qz_q = (int16_t)(qz * 32767.0f);
+
+  // 3. Prepare the 14-byte packet (padded to 20 bytes for BLE)
+  uint8_t packet[BLE_PACKET_SIZE];
+  memset(packet, 0, BLE_PACKET_SIZE);  // Zero-fill entire packet
   
-  // Create packet
-  OrientationPacket packet;
-  packet.sequenceNumber = sequenceNumber;
-  packet.nodeId = NODE_ID;
-  packet.timestamp = timestamp;
-  packet.qw = qw;
-  packet.qx = qx;
-  packet.qy = qy;
-  packet.qz = qz;
+  packet[0] = sequenceNumber; // Sequence number (uint8_t)
+  packet[1] = NODE_ID;        // Node ID (uint8_t)
+
+  // Copy the 4-byte timestamp (little-endian)
+  memcpy(&packet[2], &relativeTimestamp, 4);
   
-  // Queue packet for transmission instead of sending directly
-  if (!enqueueBLEPacket(ORIENTATION_CHAR, (uint8_t*)&packet, sizeof(OrientationPacket))) {
+  // Copy the 2-byte quantized quaternion components (little-endian)
+  memcpy(&packet[6], &qw_q, 2);
+  memcpy(&packet[8], &qx_q, 2);
+  memcpy(&packet[10], &qy_q, 2);
+  memcpy(&packet[12], &qz_q, 2);
+  // Bytes 14-19 are padding (already zeroed by memset)
+
+  // 4. Queue the packet for transmission
+  if (!enqueueBLEPacket(ORIENTATION_CHAR, packet, BLE_PACKET_SIZE)) {
     #if DEBUG_MODE
       Serial.println("ERROR: Failed to queue orientation packet!");
     #endif
@@ -1017,7 +1037,7 @@ void transmitData() {
       Serial.print(qx, 4); Serial.print(", ");
       Serial.print(qy, 4); Serial.print(", ");
       Serial.print(qz, 4); Serial.print("] @ ");
-      Serial.print(timestamp * 10); Serial.println("ms");
+      Serial.print(relativeTimestamp); Serial.println("ms");
     }
   #endif
   
@@ -1195,42 +1215,18 @@ void handleResetCommand() {
 }
 
 void handleTimeSyncCommand(uint8_t* command, int len) {
-  if (len < 5) {
-    return;
-  }
+  // Reset the session clock by capturing the current millis()
+  // This synchronizes all Arduinos to T=0 at the same moment
+  sessionStartTime = millis(); 
   
-  // Extract RPI reference timestamp (milliseconds since epoch)
-  uint32_t rpiTimestampMs;
-  memcpy(&rpiTimestampMs, &command[1], 4);
-  
-  // Store synchronized timestamp and local reference
-  syncedTimestampMs = rpiTimestampMs;
-  syncedLocalMillis = millis();
-  isTimeSynced = true;
-  
-  // Reset timestamp to 0 for relative time tracking from session start
-  // The RPI sends t=0 at session start, so we start counting from there
-  // NOTE: This timestamp will NOT be reset again by START command to avoid
-  // false wraparound detection. It continues incrementing until START is received.
+  // Reset timestamp to 0 for clean start
   timestamp = 0;
   
-  // Reset drift compensation tracking
-  lastSampleMicros = micros();
-  cumulativeDriftMicros = 0;
-  
   #if DEBUG_MODE
-    Serial.println();
-    Serial.println(">>> TIME SYNCHRONIZATION <<<");
-    Serial.print(">>> RPI Reference: ");
-    Serial.print(rpiTimestampMs);
+    Serial.println(">>> Time synchronized - clock reset to T=0");
+    Serial.print(">>> sessionStartTime set to: ");
+    Serial.print(sessionStartTime);
     Serial.println(" ms");
-    Serial.print(">>> Local millis(): ");
-    Serial.print(syncedLocalMillis);
-    Serial.println(" ms");
-    Serial.print(">>> Timestamp (10ms ticks): ");
-    Serial.println(timestamp);
-    Serial.println(">>> Time sync complete");
-    Serial.println();
   #endif
 }
 
