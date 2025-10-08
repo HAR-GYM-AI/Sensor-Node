@@ -57,9 +57,6 @@ enum NodePlacement : uint8_t {
   THIGH = 3
 };
 
-uint16_t shortWindowId = 0;
-uint16_t longWindowId = 0;
-
 // IMPORTANT: CHANGE THIS FOR EACH DEVICE 
 // Set to WRIST, BICEP, CHEST, or THIGH based on physical placement
 #define NODE_PLACEMENT BICEP  // ← CHANGE THIS
@@ -107,6 +104,20 @@ unsigned long systemStartTime = 0;
 uint16_t timestamp = 0;  // 2-byte timestamp in 10ms ticks
 uint8_t sequenceNumber = 0;
 
+// Synchronized timing (for multi-node coordination)
+uint32_t syncedTimestampMs = 0;  // RPI reference timestamp in milliseconds
+unsigned long syncedLocalMillis = 0;  // Local millis() when sync occurred
+bool isTimeSynced = false;
+
+// BLE Transmission Staggering (to avoid bandwidth congestion)
+// Each node gets a unique offset to prevent simultaneous transmission
+// WRIST(0): 0ms, BICEP(1): 2.5ms, CHEST(2): 5ms, THIGH(3): 7.5ms
+unsigned long transmissionOffsetMs = 0;
+
+// High-precision timing and drift compensation
+unsigned long lastSampleMicros = 0;  // Last sample time in microseconds
+int16_t cumulativeDriftMicros = 0;   // Accumulated drift in microseconds
+
 // IMU Data
 float ax, ay, az;  // Accelerometer (g)
 float gx, gy, gz;  // Gyroscope (dps)
@@ -135,6 +146,8 @@ uint16_t shortWindowSampleCount = 0;
 uint16_t longWindowSampleCount = 0;
 uint16_t samplesSinceLastShortWindow = 0;
 uint16_t samplesSinceLastLongWindow = 0;
+uint16_t shortWindowId = 0;
+uint16_t longWindowId = 0;
 
 
 
@@ -392,12 +405,13 @@ void monitorBLEQueue() {
 struct OrientationPacket {
   uint8_t sequenceNumber;  // 1 byte
   uint8_t nodeId;          // 1 byte
-  uint16_t timestamp;      // 2 bytes
+  uint16_t timestamp;      // 2 bytes (10ms ticks, for backward compatibility)
   float qw;                // 4 bytes
   float qx;                // 4 bytes
   float qy;                // 4 bytes
   float qz;                // 4 bytes
   // Total: 20 bytes
+  // Note: Synchronized timestamp (ms) can be calculated from timestamp and sync reference
 };
 
 // Node identification packet sent on connection
@@ -481,6 +495,17 @@ void setup() {
     Serial.println("AHRS Filter initialized");
   #endif
   
+  // Initialize BLE transmission staggering
+  // Each node gets a unique offset to prevent simultaneous transmission
+  // This distributes BLE bandwidth more evenly across multiple devices
+  transmissionOffsetMs = NODE_ID * 2.5;  // 2.5ms per node (0, 2.5, 5, 7.5 ms)
+  
+  #if DEBUG_MODE
+    Serial.print("Transmission offset: ");
+    Serial.print(transmissionOffsetMs, 1);
+    Serial.println(" ms (prevents BLE congestion)");
+  #endif
+  
   // Initialize BLE
   if (!BLE.begin()) {
     #if DEBUG_MODE
@@ -528,6 +553,8 @@ void loop() {
     // Reset timing when connection established
     systemStartTime = millis();
     lastSampleTime = millis();
+    lastSampleMicros = micros();
+    cumulativeDriftMicros = 0;
     timestamp = 0;
     sequenceNumber = 0;
     
@@ -570,11 +597,49 @@ void loop() {
           continue;
         }
         
-        unsigned long currentTime = millis();
+        // === HIGH-PRECISION TIMING WITH DRIFT COMPENSATION ===
+        unsigned long currentMicros = micros();
         
-        // Check if it's time for next sample (100Hz = 10ms period)
-        if (currentTime - lastSampleTime >= SAMPLING_PERIOD_MS) {
-          lastSampleTime = currentTime;
+        // Calculate target time for sampling (100Hz = 10000us period)
+        // NOTE: transmission offset is NOT included here - both devices sample at same rate
+        // The offset only applies to BLE transmission timing (see transmitData function)
+        unsigned long targetMicros = lastSampleMicros + (SAMPLING_PERIOD_MS * 1000UL);
+        
+        if (currentMicros >= targetMicros) {
+          // Measure actual elapsed time
+          unsigned long actualElapsed = currentMicros - lastSampleMicros;
+          unsigned long expectedElapsed = (SAMPLING_PERIOD_MS * 1000UL);
+          
+          // Calculate drift in microseconds (positive = too slow, negative = too fast)
+          int32_t driftMicros = (int32_t)(actualElapsed - expectedElapsed);
+          
+          // Accumulate drift for periodic compensation
+          if (driftMicros > 100 || driftMicros < -100) {  // Only track if > 100us drift
+            cumulativeDriftMicros += driftMicros;
+            
+            // Apply timestamp compensation every 100 samples (~1 second at 100Hz)
+            if (timestamp % 100 == 0 && cumulativeDriftMicros != 0) {
+              // Adjust timestamp by drift (convert microseconds to 10ms ticks)
+              int16_t driftTicks = cumulativeDriftMicros / 10000;  // 10000us = 1 tick
+              timestamp += driftTicks;
+              
+              #if DEBUG_MODE
+                if (driftTicks != 0) {
+                  Serial.print("Drift compensation: ");
+                  Serial.print(driftTicks);
+                  Serial.print(" ticks (");
+                  Serial.print(cumulativeDriftMicros);
+                  Serial.println(" us)");
+                }
+              #endif
+              
+              cumulativeDriftMicros = 0;  // Reset after compensation
+            }
+          }
+          
+          // Update timing references
+          lastSampleMicros = currentMicros;
+          lastSampleTime = millis();
           
           // Read IMU and process
           if (readIMU()) {
@@ -1028,8 +1093,9 @@ void handleStartCommand(uint8_t* command, int len) {
     Serial.println(">>> Starting data collection...");
   #endif
   
-  // Reset counters
-  timestamp = 0;
+  // DON'T reset timestamp here - it was already reset during time sync
+  // Resetting it here causes false wraparound detection on the RPI side
+  // Only reset sequence number and update system timing
   sequenceNumber = 0;
   systemStartTime = millis();
   lastSampleTime = millis();
@@ -1040,9 +1106,52 @@ void handleStartCommand(uint8_t* command, int len) {
 void handleStopCommand() {
   #if DEBUG_MODE
     Serial.println(">>> Stopping data collection...");
+    Serial.print("BLE queue has ");
+    Serial.print(getBLEQueueCount());
+    Serial.println(" packets pending...");
   #endif
   
+  // Stop sampling immediately
   isRunning = false;
+  
+  #if DEBUG_MODE
+    Serial.println("Flushing BLE queue to prevent data loss...");
+  #endif
+  
+  // Flush the BLE queue before fully stopping
+  // This ensures all collected data is transmitted
+  unsigned long flushStartTime = millis();
+  unsigned long timeout = 5000;  // 5 second timeout for safety
+  
+  while (getBLEQueueCount() > 0 && (millis() - flushStartTime < timeout)) {
+    BLE.poll();  // Keep BLE stack running
+    processBLEQueue();  // Transmit queued packets
+    
+    #if DEBUG_MODE
+      // Log progress every 50 packets
+      static uint16_t lastQueueCount = 0;
+      uint16_t currentCount = getBLEQueueCount();
+      if (lastQueueCount != currentCount && currentCount % 50 == 0) {
+        Serial.print("  Flushing... ");
+        Serial.print(currentCount);
+        Serial.println(" packets remaining");
+        lastQueueCount = currentCount;
+      }
+    #endif
+  }
+  
+  #if DEBUG_MODE
+    if (getBLEQueueCount() == 0) {
+      Serial.println("BLE queue flushed successfully!");
+    } else {
+      Serial.print("WARNING: Flush timeout - ");
+      Serial.print(getBLEQueueCount());
+      Serial.println(" packets still in queue");
+    }
+    Serial.print("Flush took ");
+    Serial.print(millis() - flushStartTime);
+    Serial.println(" ms");
+  #endif
 }
 
 void handleCalibrateCommand() {
@@ -1090,17 +1199,38 @@ void handleTimeSyncCommand(uint8_t* command, int len) {
     return;
   }
   
-  // Extract new timestamp from command
-  uint32_t newTime;
-  memcpy(&newTime, &command[1], 4);
+  // Extract RPI reference timestamp (milliseconds since epoch)
+  uint32_t rpiTimestampMs;
+  memcpy(&rpiTimestampMs, &command[1], 4);
   
-  // Update timestamp (convert from milliseconds to 10ms ticks)
-  timestamp = (uint16_t)(newTime / 10);
+  // Store synchronized timestamp and local reference
+  syncedTimestampMs = rpiTimestampMs;
+  syncedLocalMillis = millis();
+  isTimeSynced = true;
+  
+  // Reset timestamp to 0 for relative time tracking from session start
+  // The RPI sends t=0 at session start, so we start counting from there
+  // NOTE: This timestamp will NOT be reset again by START command to avoid
+  // false wraparound detection. It continues incrementing until START is received.
+  timestamp = 0;
+  
+  // Reset drift compensation tracking
+  lastSampleMicros = micros();
+  cumulativeDriftMicros = 0;
   
   #if DEBUG_MODE
-    Serial.print(">>> Time synchronized to: ");
-    Serial.print(timestamp);
-    Serial.println(" (10ms ticks)");
+    Serial.println();
+    Serial.println(">>> TIME SYNCHRONIZATION <<<");
+    Serial.print(">>> RPI Reference: ");
+    Serial.print(rpiTimestampMs);
+    Serial.println(" ms");
+    Serial.print(">>> Local millis(): ");
+    Serial.print(syncedLocalMillis);
+    Serial.println(" ms");
+    Serial.print(">>> Timestamp (10ms ticks): ");
+    Serial.println(timestamp);
+    Serial.println(">>> Time sync complete");
+    Serial.println();
   #endif
 }
 
@@ -1112,17 +1242,20 @@ void handleHeartbeat() {
   // Small delay to ensure client is ready to receive
   delay(10);
   
-  // Respond to heartbeat/ping
-  uint8_t response[6];
+  // Respond to heartbeat/ping (pad to BLE_PACKET_SIZE = 20 bytes)
+  uint8_t response[BLE_PACKET_SIZE];
+  memset(response, 0, BLE_PACKET_SIZE);  // Zero-fill entire packet
+  
   response[0] = 0xFF;  // Heartbeat response
   response[1] = NODE_ID;
   response[2] = isRunning ? 1 : 0;
   response[3] = isCalibrated ? 1 : 0;
   response[4] = (uint8_t)(timestamp >> 8);
   response[5] = (uint8_t)(timestamp & 0xFF);
+  // Bytes 6-19 are padding (already zeroed by memset)
   
   // Queue heartbeat response for transmission
-  if (!enqueueBLEPacket(CONTROL_CHAR, response, 6)) {
+  if (!enqueueBLEPacket(CONTROL_CHAR, response, BLE_PACKET_SIZE)) {
     #if DEBUG_MODE
       Serial.println("ERROR: Failed to queue heartbeat response!");
     #endif
