@@ -9,7 +9,8 @@
  * - 100Hz sampling rate with hardware timer
  * - Calibration support
  * - Circular buffer for transmission recovery
- * - Window-based feature extraction with raw sample bundling
+ * - Sliding window buffers maintained for RPI-side feature extraction
+ * - Raw quaternion transmission only (features extracted on RPI)
  * 
  * NODE CONFIGURATION:
  * Each device MUST be configured with a unique placement before deployment:
@@ -30,6 +31,9 @@
 #include <Arduino_LSM6DS3.h>
 #include <ArduinoBLE.h>
 #include <Adafruit_AHRS.h>
+
+// Force struct packing to 1 byte alignment
+#pragma pack(1)
 
 // CONFIG
 
@@ -52,6 +56,9 @@ enum NodePlacement : uint8_t {
   CHEST = 2,
   THIGH = 3
 };
+
+uint16_t shortWindowId = 0;
+uint16_t longWindowId = 0;
 
 // IMPORTANT: CHANGE THIS FOR EACH DEVICE 
 // Set to WRIST, BICEP, CHEST, or THIGH based on physical placement
@@ -82,15 +89,6 @@ enum NodePlacement : uint8_t {
 #define SERVICE_UUID        "19B10000-E8F2-537E-4F6C-D104768A1214"
 #define ORIENTATION_CHAR_UUID "19B10001-E8F2-537E-4F6C-D104768A1214"
 #define CONTROL_CHAR_UUID   "19B10002-E8F2-537E-4F6C-D104768A1214"
-#define FEATURES_SHORT_CHAR_UUID "19B10003-E8F2-537E-4F6C-D104768A1214"
-#define FEATURES_LONG_CHAR_UUID  "19B10004-E8F2-537E-4F6C-D104768A1214"
-
-// Packet Type Constants
-#define PKT_TYPE_FEATURES_1 0x11
-#define PKT_TYPE_FEATURES_2 0x12
-#define PKT_TYPE_FEATURES_3 0x13
-#define PKT_TYPE_SAMPLE_1   0x21
-#define PKT_TYPE_SAMPLE_2   0x22
 
 
 // GLOBAL VARIABLES
@@ -98,9 +96,7 @@ enum NodePlacement : uint8_t {
 // BLE Service and Characteristics
 BLEService sensorService(SERVICE_UUID);
 BLECharacteristic orientationChar(ORIENTATION_CHAR_UUID, BLERead | BLENotify, 20);
-BLECharacteristic controlChar(CONTROL_CHAR_UUID, BLERead | BLEWrite | BLENotify, 20);
-BLECharacteristic featuresShortChar(FEATURES_SHORT_CHAR_UUID, BLERead | BLENotify, 20);
-BLECharacteristic featuresLongChar(FEATURES_LONG_CHAR_UUID, BLERead | BLENotify, 20);
+BLECharacteristic controlChar(CONTROL_CHAR_UUID, BLEWrite | BLENotify, 20);
 
 // Adafruit AHRS Madgwick Filter
 Adafruit_Madgwick filter;
@@ -141,26 +137,7 @@ uint16_t samplesSinceLastShortWindow = 0;
 uint16_t samplesSinceLastLongWindow = 0;
 
 
-// Feature Extraction Results
-struct WindowFeatures {
-  uint8_t windowType;      // 0=short, 1=long
-  uint8_t nodeId;
-  uint16_t windowId;
-  float qw_mean;
-  float qx_mean;
-  float qy_mean;
-  float qz_mean;
-  float qw_std;
-  float qx_std;
-  float qy_std;
-  float qz_std;
-  float sma;               // Signal Magnitude Area
-  float dominantFreq;      // Dominant frequency component
-};
 
-
-uint16_t shortWindowId = 0;
-uint16_t longWindowId = 0;
 
 
 // Circular Buffer for BLE Recovery
@@ -172,25 +149,244 @@ struct SensorData {
 SensorData dataBuffer[BUFFER_SIZE];
 uint8_t bufferIndex = 0;
 
+// BLE TRANSMISSION QUEUE
+// All packets are 20 bytes, so we can use a generic structure
+#define BLE_PACKET_SIZE 20
+#define BLE_QUEUE_SIZE 256  // Buffer up to 1024 packets (20KB RAM usage)
+
+enum BLECharacteristicType {
+  ORIENTATION_CHAR = 0,
+  CONTROL_CHAR = 1
+};
+
+struct BLEPacket {
+  BLECharacteristicType charType;  // Which BLE characteristic to send on
+  uint8_t data[BLE_PACKET_SIZE];   // The packet data
+  uint32_t enqueueTime;            // When packet was queued (for timeout handling)
+};
+
+struct BLETransmissionQueue {
+  BLEPacket queue[BLE_QUEUE_SIZE];
+  uint16_t head;                   // Index of next packet to transmit
+  uint16_t tail;                   // Index of next free slot
+  uint16_t count;                  // Number of packets in queue
+  uint32_t lastTransmitTime;       // Last time we transmitted a packet
+  bool isTransmitting;             // Flag to prevent concurrent transmission
+};
+
+// Global queue instance
+BLETransmissionQueue bleQueue;
+
 // System State
 bool isRunning = false;
 bool bleConnected = false;
-bool enableWindowing = true;  // Enable/disable windowing mode
+
+// BLE TRANSMISSION QUEUE FUNCTIONS
+void initBLEQueue() {
+  bleQueue.head = 0;
+  bleQueue.tail = 0;
+  bleQueue.count = 0;
+  bleQueue.lastTransmitTime = 0;
+  bleQueue.isTransmitting = false;
+}
+
+bool enqueueBLEPacket(BLECharacteristicType charType, const uint8_t* data, uint8_t dataSize) {
+  if (dataSize != BLE_PACKET_SIZE) {
+    #if DEBUG_MODE
+      Serial.print("ERROR: Invalid packet size ");
+      Serial.println(dataSize);
+    #endif
+    return false;
+  }
+  
+  if (bleQueue.count >= BLE_QUEUE_SIZE) {
+    #if DEBUG_MODE
+      Serial.println("ERROR: BLE queue full! Packet dropped.");
+    #endif
+    return false;  // Queue full
+  }
+  
+  // Copy data to queue
+  bleQueue.queue[bleQueue.tail].charType = charType;
+  memcpy(bleQueue.queue[bleQueue.tail].data, data, BLE_PACKET_SIZE);
+  bleQueue.queue[bleQueue.tail].enqueueTime = millis();
+  
+  // Update queue pointers
+  bleQueue.tail = (bleQueue.tail + 1) % BLE_QUEUE_SIZE;
+  bleQueue.count++;
+  
+  #if DEBUG_MODE
+    if (bleQueue.count % 50 == 0) {  // Log every 50 packets to avoid spam
+      Serial.print("BLE Queue: ");
+      Serial.print(bleQueue.count);
+      Serial.print("/");
+      Serial.println(BLE_QUEUE_SIZE);
+    }
+  #endif
+  
+  return true;
+}
+
+bool dequeueBLEPacket(BLEPacket* packet) {
+  if (bleQueue.count == 0) {
+    return false;  // Queue empty
+  }
+  
+  // Copy packet data
+  *packet = bleQueue.queue[bleQueue.head];
+  
+  // Update queue pointers
+  bleQueue.head = (bleQueue.head + 1) % BLE_QUEUE_SIZE;
+  bleQueue.count--;
+  
+  return true;
+}
+
+uint16_t getBLEQueueCount() {
+  return bleQueue.count;
+}
+
+bool isBLEQueueFull() {
+  return bleQueue.count >= BLE_QUEUE_SIZE;
+}
+
+bool isBLEQueueEmpty() {
+  return bleQueue.count == 0;
+}
+
+void processBLEQueue() {
+  if (!bleConnected || bleQueue.isTransmitting) {
+    return;  // Not connected or already transmitting
+  }
+  
+  unsigned long currentTime = millis();
+  
+  // Rate limiting: don't transmit more than one packet every 5ms to avoid BLE congestion
+  // This allows up to 200 packets/second, which should handle our data rates:
+  // - Raw mode: 100 packets/sec (well within limit)
+  // - Window mode: bursts of 300-600 packets, but spaced out by window intervals
+  if (currentTime - bleQueue.lastTransmitTime < 5) {
+    return;  // Too soon since last transmission
+  }
+  
+  BLEPacket packet;
+  if (!dequeueBLEPacket(&packet)) {
+    return;  // No packets to send
+  }
+  
+  bleQueue.isTransmitting = true;
+  
+  // Transmit based on characteristic type
+  bool success = false;
+  switch (packet.charType) {
+    case ORIENTATION_CHAR:
+      success = orientationChar.writeValue(packet.data, BLE_PACKET_SIZE);
+      break;
+    case CONTROL_CHAR:
+      success = controlChar.writeValue(packet.data, BLE_PACKET_SIZE);
+      break;
+    default:
+      #if DEBUG_MODE
+        Serial.print("ERROR: Unknown characteristic type ");
+        Serial.println(packet.charType);
+      #endif
+      success = false;
+      break;
+  }
+  
+  if (success) {
+    bleQueue.lastTransmitTime = currentTime;
+    
+    #if DEBUG_MODE
+      // Occasional status logging
+      static uint16_t packetCount = 0;
+      packetCount++;
+      if (packetCount % 100 == 0) {
+        Serial.print("BLE: Transmitted packet ");
+        Serial.print(packetCount);
+        Serial.print(" (queue: ");
+        Serial.print(bleQueue.count);
+        Serial.println(" remaining)");
+      }
+    #endif
+  } else {
+    #if DEBUG_MODE
+      Serial.println("ERROR: BLE transmission failed! Re-queuing packet.");
+    #endif
+    // Re-queue the packet at the front (higher priority)
+    // Note: This is a simplified approach. In production, you might want
+    // more sophisticated retry logic with backoff.
+    if (bleQueue.count < BLE_QUEUE_SIZE) {
+      // Shift head back to re-insert at front
+      bleQueue.head = (bleQueue.head - 1 + BLE_QUEUE_SIZE) % BLE_QUEUE_SIZE;
+      bleQueue.queue[bleQueue.head] = packet;
+      bleQueue.count++;
+    } else {
+      #if DEBUG_MODE
+        Serial.println("ERROR: Could not re-queue failed packet - queue still full!");
+      #endif
+    }
+  }
+  
+  bleQueue.isTransmitting = false;
+}
+
+void monitorBLEQueue() {
+  static unsigned long lastMonitorTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Monitor queue health every 5 seconds
+  if (currentTime - lastMonitorTime < 5000) {
+    return;
+  }
+  lastMonitorTime = currentTime;
+  
+  uint16_t queueCount = getBLEQueueCount();
+  float queueUtilization = (float)queueCount / BLE_QUEUE_SIZE * 100.0;
+  
+  #if DEBUG_MODE
+    if (queueUtilization > 80.0) {
+      Serial.print("WARNING: BLE queue utilization high: ");
+      Serial.print(queueUtilization, 1);
+      Serial.print("% (");
+      Serial.print(queueCount);
+      Serial.println(" packets)");
+    } else if (queueCount > 0) {
+      Serial.print("BLE queue status: ");
+      Serial.print(queueCount);
+      Serial.print("/");
+      Serial.print(BLE_QUEUE_SIZE);
+      Serial.print(" packets (");
+      Serial.print(queueUtilization, 1);
+      Serial.println("%)");
+    }
+  #endif
+  
+  // Check for stale packets (older than 30 seconds)
+  // This helps prevent memory issues if transmission gets stuck
+  if (queueCount > 0) {
+    unsigned long oldestPacketTime = bleQueue.queue[bleQueue.head].enqueueTime;
+    unsigned long age = currentTime - oldestPacketTime;
+    
+    if (age > 30000) {  // 30 seconds
+      #if DEBUG_MODE
+        Serial.print("WARNING: Removing stale packet aged ");
+        Serial.print(age / 1000);
+        Serial.println(" seconds");
+      #endif
+      
+      // Remove the stale packet
+      BLEPacket dummy;
+      dequeueBLEPacket(&dummy);
+    }
+  }
+}
 
 // PACKET STRUCTURE
 //
-// WINDOWING MODE (enableWindowing = true):
-//   When a window is ready, sends:
-//   1. FeaturePacket (means)
-//   2. FeaturePacket2 (std devs)
-//   3. FeaturePacket3 (SMA, freq, sample count)
-//   4. WindowSamplePacket1 + WindowSamplePacket2 (repeated for each sample in window)
-//
-//   Short Window: 3 + (150 * 2) = 303 packets every ~380ms
-//   Long Window:  3 + (300 * 2) = 603 packets every ~1500ms
-//
-// RAW MODE (enableWindowing = false):
+// RAW MODE:
 //   Sends OrientationPacket continuously at 100Hz
+//   Windowing is maintained in buffers for RPI-side processing
 //
 
 struct OrientationPacket {
@@ -201,84 +397,6 @@ struct OrientationPacket {
   float qx;                // 4 bytes
   float qy;                // 4 bytes
   float qz;                // 4 bytes
-  // Total: 20 bytes
-};
-
-struct FeaturePacket {
-  uint8_t packetType;      //e.g., PKT_TYPE_FEATURES_1
-  uint8_t windowType;      // 0=short, 1=long
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  float qw_mean;           // 4 bytes
-  float qx_mean;           // 4 bytes
-  float qy_mean;           // 4 bytes
-  float qz_mean;           // 4 bytes
-  uint8_t padding[1];      // 1 byte padding to keep total 20 bytes
-  // Total: 20 bytes (first packet)
-};
-
-struct FeaturePacket2 {
-  uint8_t packetType;      // e.g., PKT_TYPE_FEATURES_2
-  uint8_t windowType;      // 1 byte
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  float qw_std;            // 4 bytes
-  float qx_std;            // 4 bytes
-  float qy_std;            // 4 bytes
-  float qz_std;            // 4 bytes
-  uint8_t padding[1];      // 1 byte padding to keep total 20 bytes
-  // Total: 20 bytes (second packet)
-};
-
-struct FeaturePacket3 {
-  uint8_t packetType;      // e.g., PKT_TYPE_FEATURES_3
-  uint8_t windowType;      // 1 byte
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  float sma;               // 4 bytes
-  float dominantFreq;      // 4 bytes
-  uint16_t totalSamples;   // 2 bytes - number of samples in window
-  uint8_t padding[5];      // 5 bytes padding to keep total 20 bytes
-  // Total: 20 bytes (third packet)
-};
-
-// Packet for raw quaternion samples within a window
-struct WindowSamplePacket {
-  uint8_t windowType;      // 1 byte (0=short, 1=long)
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  uint16_t sampleIndex;    // 2 bytes - index within window (0 to windowSize-1)
-  uint16_t timestamp;      // 2 bytes
-  float qw;                // 4 bytes
-  float qx;                // 4 bytes
-  float qy;                // 4 bytes
-  float qz;                // 4 bytes
-  // Total: 24 bytes - EXCEEDS 20! Need to split
-};
-
-// Split into two packets due to 20-byte BLE limit
-struct WindowSamplePacket1 {
-  uint8_t packetType;      // PKT_TYPE_SAMPLE_1
-  uint8_t windowType;      // 1 byte
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  uint16_t sampleIndex;    // 2 bytes
-  uint16_t timestamp;      // 2 bytes
-  float qw;                // 4 bytes
-  float qx;                // 4 bytes
-  uint8_t padding[3];      // 3 bytes padding to keep total 20 bytes
-  // Total: 20 bytes
-};
-
-struct WindowSamplePacket2 {
-  uint8_t packetType;      //PKT_TYPE_SAMPLE_2
-  uint8_t windowType;      // 1 byte
-  uint8_t nodeId;          // 1 byte
-  uint16_t windowId;       // 2 bytes
-  uint16_t sampleIndex;    // 2 bytes
-  float qy;                // 4 bytes
-  float qz;                // 4 bytes
-  uint8_t padding[5];      // 5 bytes padding to keep total 20 bytes
   // Total: 20 bytes
 };
 
@@ -294,7 +412,6 @@ struct NodeIdentificationPacket {
   uint8_t padding[11];     // 11 bytes padding
   // Total: 20 bytes
 };
-
 
 // SETUP
 
@@ -375,7 +492,11 @@ void setup() {
   // Set up BLE
   setupBLE();
   
+  // Initialize BLE transmission queue
+  initBLEQueue();
+  
   #if DEBUG_MODE
+    Serial.println("BLE transmission queue initialized");
     Serial.println("System ready. Waiting for BLE connection...");
     Serial.println("========================================");
     Serial.println();
@@ -422,6 +543,12 @@ void loop() {
     
     while (central.connected()) {
       BLE.poll();
+      
+      // Process BLE transmission queue
+      processBLEQueue();
+      
+      // Monitor queue health
+      monitorBLEQueue();
 
       // Check for control commands
       if (controlChar.written()) {
@@ -430,6 +557,19 @@ void loop() {
       
       // Sample and transmit data if running
       if (isRunning) {
+        // Check if BLE queue is too full - apply backpressure to prevent data loss
+        if (getBLEQueueCount() > BLE_QUEUE_SIZE * 0.9) {  // 90% full
+          #if DEBUG_MODE
+            static unsigned long lastBackpressureWarning = 0;
+            if (millis() - lastBackpressureWarning > 1000) {  // Warn once per second
+              Serial.println("WARNING: BLE queue nearly full - applying backpressure (skipping sample)");
+              lastBackpressureWarning = millis();
+            }
+          #endif
+          // Skip this sample to allow queue to drain
+          continue;
+        }
+        
         unsigned long currentTime = millis();
         
         // Check if it's time for next sample (100Hz = 10ms period)
@@ -441,27 +581,12 @@ void loop() {
             applyCalibration();
             updateOrientation();
             
-            if (enableWindowing) {
-              // Add to sliding windows
-              addToWindows();
-              
-              // Check if windows are ready for feature extraction
-              if (samplesSinceLastShortWindow >= SHORT_WINDOW_STEP && shortWindowSampleCount >= SHORT_WINDOW_SIZE) {
-                extractAndTransmitFeatures(0);  // Short window (classification)
-                samplesSinceLastShortWindow = 0;
-                shortWindowId++;
-              }
-              
-              if (samplesSinceLastLongWindow >= LONG_WINDOW_STEP && longWindowSampleCount >= LONG_WINDOW_SIZE) {
-                extractAndTransmitFeatures(1);  // Long window (rep counting)
-                samplesSinceLastLongWindow = 0;
-                longWindowId++;
-              }
-            } else {
-              // When windowing is disabled, send raw data continuously
-              storeInBuffer();
-              transmitData();
-            }
+            // Add to sliding windows for RPI-side processing
+            addToWindows();
+            
+            // Always transmit raw quaternion data
+            storeInBuffer();
+            transmitData();
             
             #if DEBUG_MODE
               // In debug mode, print detailed packet info every 50 samples (0.5 sec)
@@ -523,17 +648,9 @@ void setupBLE() {
   BLEDescriptor controlDescriptor("2901", "Control Channel");
   controlChar.addDescriptor(controlDescriptor);
   
-  BLEDescriptor featuresShortDescriptor("2901", "Features Short Window");
-  featuresShortChar.addDescriptor(featuresShortDescriptor);
-  
-  BLEDescriptor featuresLongDescriptor("2901", "Features Long Window");
-  featuresLongChar.addDescriptor(featuresLongDescriptor);
-  
   // Add characteristics to service
   sensorService.addCharacteristic(orientationChar);
   sensorService.addCharacteristic(controlChar);
-  sensorService.addCharacteristic(featuresShortChar);
-  sensorService.addCharacteristic(featuresLongChar);
 
   
   // Add service
@@ -588,15 +705,41 @@ void updateOrientation() {
   // Get quaternion output - getQuaternion() fills the provided variables
   filter.getQuaternion(&qw, &qx, &qy, &qz);
   
-  // The Adafruit library already normalizes quaternions internally,
-  // but we'll add a safety check
+  // Check for NaN or infinite values and replace with safe defaults
+  if (isnan(qw) || isinf(qw)) qw = 1.0;
+  if (isnan(qx) || isinf(qx)) qx = 0.0;
+  if (isnan(qy) || isinf(qy)) qy = 0.0;
+  if (isnan(qz) || isinf(qz)) qz = 0.0;
+  
+  // Always normalize quaternions to ensure unit length
   float norm = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-  if (norm > 0.0001 && abs(norm - 1.0) > 0.01) {  // Only normalize if needed
+  if (norm > 0.0001) {
     qw /= norm;
     qx /= norm;
     qy /= norm;
     qz /= norm;
+  } else {
+    // If norm is too small, reset to identity quaternion
+    qw = 1.0;
+    qx = 0.0;
+    qy = 0.0;
+    qz = 0.0;
   }
+  
+  #if DEBUG_MODE
+    // Debug: Print quaternion values every 100 samples
+    static uint16_t debug_counter = 0;
+    debug_counter++;
+    if (debug_counter % 100 == 0) {
+      Serial.print("Quaternion: [");
+      Serial.print(qw, 4); Serial.print(", ");
+      Serial.print(qx, 4); Serial.print(", ");
+      Serial.print(qy, 4); Serial.print(", ");
+      Serial.print(qz, 4); Serial.println("]");
+      float q_norm = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+      Serial.print("Norm: "); Serial.println(q_norm, 6);
+    }
+  #endif
 }
 
 // CALIBRATION
@@ -644,293 +787,7 @@ void addToWindows() {
   samplesSinceLastLongWindow++;
 }
 
-void extractAndTransmitFeatures(uint8_t windowType) {
-  WindowFeatures features;
-  features.windowType = windowType;
-  features.nodeId = NODE_ID;
-  
-  QuaternionSample* buffer;
-  uint16_t windowSize;
-  
-  if (windowType == 0) {
-    // Short window
-    buffer = shortWindowBuffer;
-    windowSize = SHORT_WINDOW_SIZE;
-    features.windowId = shortWindowId;
-  } else {
-    // Long window
-    buffer = longWindowBuffer;
-    windowSize = LONG_WINDOW_SIZE;
-    features.windowId = longWindowId;
-  }
-  
-  // Calculate mean
-  float sum_qw = 0, sum_qx = 0, sum_qy = 0, sum_qz = 0;
-  for (uint16_t i = 0; i < windowSize; i++) {
-    sum_qw += buffer[i].qw;
-    sum_qx += buffer[i].qx;
-    sum_qy += buffer[i].qy;
-    sum_qz += buffer[i].qz;
-  }
-  
-  features.qw_mean = sum_qw / windowSize;
-  features.qx_mean = sum_qx / windowSize;
-  features.qy_mean = sum_qy / windowSize;
-  features.qz_mean = sum_qz / windowSize;
-  
-  // Calculate standard deviation
-  float sum_sq_qw = 0, sum_sq_qx = 0, sum_sq_qy = 0, sum_sq_qz = 0;
-  for (uint16_t i = 0; i < windowSize; i++) {
-    sum_sq_qw += pow(buffer[i].qw - features.qw_mean, 2);
-    sum_sq_qx += pow(buffer[i].qx - features.qx_mean, 2);
-    sum_sq_qy += pow(buffer[i].qy - features.qy_mean, 2);
-    sum_sq_qz += pow(buffer[i].qz - features.qz_mean, 2);
-  }
-  
-  features.qw_std = sqrt(sum_sq_qw / windowSize);
-  features.qx_std = sqrt(sum_sq_qx / windowSize);
-  features.qy_std = sqrt(sum_sq_qy / windowSize);
-  features.qz_std = sqrt(sum_sq_qz / windowSize);
-  
-  // Calculate Signal Magnitude Area (SMA)
-  // SMA = sum of absolute values of all quaternion components
-  features.sma = 0;
-  for (uint16_t i = 0; i < windowSize; i++) {
-    features.sma += abs(buffer[i].qw) + abs(buffer[i].qx) + abs(buffer[i].qy) + abs(buffer[i].qz);
-  }
-  features.sma /= windowSize;
-  
-  // Calculate dominant frequency (simplified FFT alternative)
-  // Using autocorrelation peak detection as a lightweight alternative
-  features.dominantFreq = calculateDominantFrequency(buffer, windowSize);
-  
-  // Transmit features via BLE (split into 3 packets due to 20-byte limit)
-  transmitFeatures(features);
-  
-  #if DEBUG_MODE
-    if (windowType == 0) {
-      Serial.println();
-      Serial.println("=== SHORT WINDOW FEATURES ===");
-    } else {
-      Serial.println();
-      Serial.println("=== LONG WINDOW FEATURES ===");
-    }
-    Serial.print("Window ID: "); Serial.println(features.windowId);
-    Serial.print("Mean: ["); 
-    Serial.print(features.qw_mean, 4); Serial.print(", ");
-    Serial.print(features.qx_mean, 4); Serial.print(", ");
-    Serial.print(features.qy_mean, 4); Serial.print(", ");
-    Serial.print(features.qz_mean, 4); Serial.println("]");
-    Serial.print("Std: [");
-    Serial.print(features.qw_std, 4); Serial.print(", ");
-    Serial.print(features.qx_std, 4); Serial.print(", ");
-    Serial.print(features.qy_std, 4); Serial.print(", ");
-    Serial.print(features.qz_std, 4); Serial.println("]");
-    Serial.print("SMA: "); Serial.println(features.sma, 4);
-    Serial.print("Dominant Freq: "); Serial.print(features.dominantFreq, 2); Serial.println(" Hz");
-    Serial.println("=============================");
-    Serial.println();
-  #endif
-}
 
-float calculateDominantFrequency(QuaternionSample* buffer, uint16_t windowSize) {
-  // Simplified frequency estimation using zero-crossing rate
-  // on the quaternion magnitude changes
-  
-  float prevMagnitude = sqrt(pow(buffer[0].qw, 2) + pow(buffer[0].qx, 2) + 
-                             pow(buffer[0].qy, 2) + pow(buffer[0].qz, 2));
-  int zeroCrossings = 0;
-  
-  for (uint16_t i = 1; i < windowSize; i++) {
-    float magnitude = sqrt(pow(buffer[i].qw, 2) + pow(buffer[i].qx, 2) + 
-                          pow(buffer[i].qy, 2) + pow(buffer[i].qz, 2));
-    
-    float diff = magnitude - prevMagnitude;
-    float prevDiff = prevMagnitude - sqrt(pow(buffer[i > 1 ? i-1 : 0].qw, 2) + 
-                                         pow(buffer[i > 1 ? i-1 : 0].qx, 2) + 
-                                         pow(buffer[i > 1 ? i-1 : 0].qy, 2) + 
-                                         pow(buffer[i > 1 ? i-1 : 0].qz, 2));
-    
-    if ((diff > 0 && prevDiff < 0) || (diff < 0 && prevDiff > 0)) {
-      zeroCrossings++;
-    }
-    
-    prevMagnitude = magnitude;
-  }
-  
-  // Frequency = (zero crossings / 2) / window duration
-  float windowDuration = windowSize / (float)SAMPLING_RATE_HZ;
-  float frequency = (zeroCrossings / 2.0) / windowDuration;
-  
-  return frequency;
-}
-
-void transmitFeatures(WindowFeatures& features) {
-  if (!bleConnected) return;
-  
-  #if DEBUG_MODE
-    Serial.println();
-    Serial.println("=== BLE TRANSMISSION START ===");
-    Serial.print("Window Type: ");
-    Serial.println(features.windowType == 0 ? "SHORT (Classification)" : "LONG (Rep Counting)");
-    Serial.print("Window ID: ");
-    Serial.println(features.windowId);
-    Serial.print("Timestamp: ");
-    Serial.println(millis() - systemStartTime);
-  #endif
-  
-  // Packet 1: Means
-  FeaturePacket packet1;
-  packet1.packetType = PKT_TYPE_FEATURES_1; // **SET THE TYPE**
-  packet1.windowType = features.windowType;
-  packet1.nodeId = features.nodeId;
-  packet1.windowId = features.windowId;
-  packet1.qw_mean = features.qw_mean;
-  packet1.qx_mean = features.qx_mean;
-  packet1.qy_mean = features.qy_mean;
-  packet1.qz_mean = features.qz_mean;
-  memset(packet1.padding, 0, 1);
-  
-  // Packet 2: Standard Deviations
-  FeaturePacket2 packet2;
-  packet2.packetType = PKT_TYPE_FEATURES_2; // **SET THE TYPE**
-  packet2.windowType = features.windowType;
-  packet2.nodeId = features.nodeId;
-  packet2.windowId = features.windowId;
-  packet2.qw_std = features.qw_std;
-  packet2.qx_std = features.qx_std;
-  packet2.qy_std = features.qy_std;
-  packet2.qz_std = features.qz_std;
-  memset(packet2.padding, 0, 1);
-  
-  // Packet 3: SMA and Dominant Frequency
-  FeaturePacket3 packet3;
-  packet3.packetType = PKT_TYPE_FEATURES_3; // **SET THE TYPE**
-  packet3.windowType = features.windowType;
-  packet3.nodeId = features.nodeId;
-  packet3.windowId = features.windowId;
-  packet3.sma = features.sma;
-  packet3.dominantFreq = features.dominantFreq;
-  
-  // Get window buffer and size
-  QuaternionSample* buffer;
-  uint16_t windowSize;
-  if (features.windowType == 0) {
-    buffer = shortWindowBuffer;
-    windowSize = SHORT_WINDOW_SIZE;
-  } else {
-    buffer = longWindowBuffer;
-    windowSize = LONG_WINDOW_SIZE;
-  }
-  packet3.totalSamples = windowSize;
-  memset(packet3.padding, 0, 5);
-  
-  // Send via appropriate BLE characteristic
-  if (features.windowType == 0) {
-    // Short window (classification)
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 1 (Means) via SHORT window characteristic...");
-    #endif
-    featuresShortChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
-    delay(2);  // Small delay between packets
-    
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 2 (Std Devs) via SHORT window characteristic...");
-    #endif
-    featuresShortChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
-    delay(2);
-    
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 3 (SMA & Freq) via SHORT window characteristic...");
-    #endif
-    featuresShortChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
-  } else {
-    // Long window (rep counting)
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 1 (Means) via LONG window characteristic...");
-    #endif
-    featuresLongChar.writeValue((uint8_t*)&packet1, sizeof(FeaturePacket));
-    delay(2);
-    
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 2 (Std Devs) via LONG window characteristic...");
-    #endif
-    featuresLongChar.writeValue((uint8_t*)&packet2, sizeof(FeaturePacket2));
-    delay(2);
-    
-    #if DEBUG_MODE
-      Serial.println("Transmitting Packet 3 (SMA & Freq) via LONG window characteristic...");
-    #endif
-    featuresLongChar.writeValue((uint8_t*)&packet3, sizeof(FeaturePacket3));
-  }
-  
-  #if DEBUG_MODE
-    Serial.println("✓ All 3 feature packets transmitted");
-    Serial.print("Now transmitting ");
-    Serial.print(windowSize);
-    Serial.println(" raw quaternion samples...");
-  #endif
-  
-  // Now send all raw quaternion samples from the window
-  // Each sample requires 2 packets (due to 20-byte BLE limit)
-  for (uint16_t i = 0; i < windowSize; i++) {
-    // Packet 1: windowType, nodeId, windowId, sampleIndex, timestamp, qw, qx
-    WindowSamplePacket1 samplePkt1;
-    samplePkt1.packetType = PKT_TYPE_SAMPLE_1; // **SET THE TYPE**
-    samplePkt1.windowType = features.windowType;
-    samplePkt1.nodeId = features.nodeId;
-    samplePkt1.windowId = features.windowId;
-    samplePkt1.sampleIndex = i;
-    samplePkt1.timestamp = buffer[i].timestamp;
-    samplePkt1.qw = buffer[i].qw;
-    samplePkt1.qx = buffer[i].qx;
-    memset(samplePkt1.padding, 0, 3);
-    
-    // Packet 2: windowType, nodeId, windowId, sampleIndex, qy, qz
-    WindowSamplePacket2 samplePkt2;
-    samplePkt2.packetType = PKT_TYPE_SAMPLE_2; // **SET THE TYPE**
-    samplePkt2.windowType = features.windowType;
-    samplePkt2.nodeId = features.nodeId;
-    samplePkt2.windowId = features.windowId;
-    samplePkt2.sampleIndex = i;
-    samplePkt2.qy = buffer[i].qy;
-    samplePkt2.qz = buffer[i].qz;
-    memset(samplePkt2.padding, 0, 5);
-    
-    // Send via appropriate BLE characteristic
-    if (features.windowType == 0) {
-      featuresShortChar.writeValue((uint8_t*)&samplePkt1, sizeof(WindowSamplePacket1));
-      delay(2);
-      featuresShortChar.writeValue((uint8_t*)&samplePkt2, sizeof(WindowSamplePacket2));
-      delay(2);
-    } else {
-      featuresLongChar.writeValue((uint8_t*)&samplePkt1, sizeof(WindowSamplePacket1));
-      delay(2);
-      featuresLongChar.writeValue((uint8_t*)&samplePkt2, sizeof(WindowSamplePacket2));
-      delay(2);
-    }
-    
-    #if DEBUG_MODE
-      // Print progress every 50 samples
-      if ((i + 1) % 50 == 0 || i == windowSize - 1) {
-        Serial.print("  Transmitted sample ");
-        Serial.print(i + 1);
-        Serial.print("/");
-        Serial.println(windowSize);
-      }
-    #endif
-  }
-  
-  #if DEBUG_MODE
-    Serial.println("✓ All window data transmitted successfully");
-    Serial.print("Total packets sent: 3 (features) + ");
-    Serial.print(windowSize * 2);
-    Serial.print(" (samples) = ");
-    Serial.println(3 + windowSize * 2);
-    Serial.println("=== BLE TRANSMISSION END ===");
-    Serial.println();
-  #endif
-}
 
 
 
@@ -1003,7 +860,12 @@ void sendCalibrationData() {
   memcpy(&calData[5], &gyroBiasY, 4);
   memcpy(&calData[9], &gyroBiasZ, 4);
   
-  controlChar.writeValue(calData, 13);
+  // Queue calibration response for transmission
+  if (!enqueueBLEPacket(CONTROL_CHAR, calData, 13)) {
+    #if DEBUG_MODE
+      Serial.println("ERROR: Failed to queue calibration data!");
+    #endif
+  }
 }
 
 // BUFFER MANAGEMENT
@@ -1033,12 +895,16 @@ void sendNodeIdentification() {
   idPacket.firmwareVersion = 1;  // Version 1.0
   memset(idPacket.padding, 0, 11);
   
-  // Send via control characteristic
-  controlChar.writeValue((uint8_t*)&idPacket, sizeof(NodeIdentificationPacket));
+  // Queue identification packet for transmission
+  if (!enqueueBLEPacket(CONTROL_CHAR, (uint8_t*)&idPacket, sizeof(NodeIdentificationPacket))) {
+    #if DEBUG_MODE
+      Serial.println("ERROR: Failed to queue node identification!");
+    #endif
+  }
   
   #if DEBUG_MODE
     Serial.println();
-    Serial.println("=== NODE IDENTIFICATION SENT ===");
+    Serial.println("=== NODE IDENTIFICATION QUEUED ===");
     Serial.print("Placement: ");
     Serial.println(getPlacementName(NODE_PLACEMENT));
     Serial.print("Node ID: ");
@@ -1069,8 +935,12 @@ void transmitData() {
   packet.qy = qy;
   packet.qz = qz;
   
-  // Send via BLE notification
-  orientationChar.writeValue((uint8_t*)&packet, sizeof(OrientationPacket));
+  // Queue packet for transmission instead of sending directly
+  if (!enqueueBLEPacket(ORIENTATION_CHAR, (uint8_t*)&packet, sizeof(OrientationPacket))) {
+    #if DEBUG_MODE
+      Serial.println("ERROR: Failed to queue orientation packet!");
+    #endif
+  }
   
   #if DEBUG_MODE
     // Print raw quaternion transmission every 100 samples (1 second)
@@ -1140,9 +1010,6 @@ void handleControlCommand() {
     case 0x06:  // Sync Time
       handleTimeSyncCommand(command, len);
       break;
-    case 0x07:
-      handleToggleWindowingCommand();
-      break;
       
     case 0xFF:  // Heartbeat/Ping
       handleHeartbeat();
@@ -1152,7 +1019,6 @@ void handleControlCommand() {
       #if DEBUG_MODE
         Serial.println("Unknown command!");
       #endif
-      sendAck(commandId, 0xFF);  // NACK
       break;
   }
 }
@@ -1169,7 +1035,6 @@ void handleStartCommand(uint8_t* command, int len) {
   lastSampleTime = millis();
   
   isRunning = true;
-  sendAck(0x01, 0x00);  // ACK
 }
 
 void handleStopCommand() {
@@ -1178,7 +1043,6 @@ void handleStopCommand() {
   #endif
   
   isRunning = false;
-  sendAck(0x02, 0x00);  // ACK
 }
 
 void handleCalibrateCommand() {
@@ -1188,12 +1052,10 @@ void handleCalibrateCommand() {
   performGyroCalibration();
   
   isRunning = wasRunning;  // Resume if was running
-  sendAck(0x03, 0x00);  // ACK
 }
 
 void handleSetExerciseCommand(uint8_t* command, int len) {
   if (len < 2) {
-    sendAck(0x04, 0xFF);  // NACK - invalid length
     return;
   }
   
@@ -1205,7 +1067,6 @@ void handleSetExerciseCommand(uint8_t* command, int len) {
   #endif
   
   // Note: Exercise type is just for logging, stored on RPI side
-  sendAck(0x04, 0x00);  // ACK
 }
 
 void handleResetCommand() {
@@ -1222,13 +1083,10 @@ void handleResetCommand() {
   
   // Reset filter
   filter.begin(SAMPLING_RATE_HZ);
-  
-  sendAck(0x05, 0x00);  // ACK
 }
 
 void handleTimeSyncCommand(uint8_t* command, int len) {
   if (len < 5) {
-    sendAck(0x06, 0xFF);  // NACK
     return;
   }
   
@@ -1244,26 +1102,16 @@ void handleTimeSyncCommand(uint8_t* command, int len) {
     Serial.print(timestamp);
     Serial.println(" (10ms ticks)");
   #endif
-  
-  sendAck(0x06, 0x00);  // ACK
-}
-
-void handleToggleWindowingCommand() {
-  enableWindowing = !enableWindowing;
-  
-  #if DEBUG_MODE
-    Serial.print(">>> Windowing mode: ");
-    Serial.println(enableWindowing ? "ENABLED" : "DISABLED (raw mode)");
-  #endif
-  
-  if (enableWindowing) {
-    resetWindows();
-  }
-  
-  sendAck(0x07, 0x00);  // ACK
 }
 
 void handleHeartbeat() {
+  #if DEBUG_MODE
+    Serial.println(">>> Received heartbeat request");
+  #endif
+  
+  // Small delay to ensure client is ready to receive
+  delay(10);
+  
   // Respond to heartbeat/ping
   uint8_t response[6];
   response[0] = 0xFF;  // Heartbeat response
@@ -1273,20 +1121,33 @@ void handleHeartbeat() {
   response[4] = (uint8_t)(timestamp >> 8);
   response[5] = (uint8_t)(timestamp & 0xFF);
   
-  controlChar.writeValue(response, 6);
+  // Queue heartbeat response for transmission
+  if (!enqueueBLEPacket(CONTROL_CHAR, response, 6)) {
+    #if DEBUG_MODE
+      Serial.println("ERROR: Failed to queue heartbeat response!");
+    #endif
+  }
   
   #if DEBUG_MODE
-    Serial.println(">>> Heartbeat response sent");
+    Serial.println(">>> Heartbeat response queued");
+    Serial.print(">>> Response bytes (");
+    Serial.print(sizeof(response));
+    Serial.print("): ");
+    for (int i = 0; i < 6; i++) {
+      if (response[i] < 0x10) Serial.print("0");
+      Serial.print(response[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+    Serial.print(">>> Node ID: ");
+    Serial.println(NODE_ID);
+    Serial.print(">>> Running: ");
+    Serial.println(isRunning ? "YES" : "NO");
+    Serial.print(">>> Calibrated: ");
+    Serial.println(isCalibrated ? "YES" : "NO");
+    Serial.print(">>> Timestamp: ");
+    Serial.println(timestamp);
   #endif
-}
-
-void sendAck(uint8_t commandId, uint8_t status) {
-  uint8_t ack[3];
-  ack[0] = 0xAA;  // ACK/NACK identifier
-  ack[1] = commandId;
-  ack[2] = status;  // 0x00 = success, 0xFF = failure
-  
-  controlChar.writeValue(ack, 3);
 }
 
 // printing functions  that will allow us to track the data easier It is 
@@ -1401,7 +1262,6 @@ void printConnectionStatus() {
   Serial.print("  Connected: "); Serial.println(bleConnected ? "YES" : "NO");
   Serial.print("  Running: "); Serial.println(isRunning ? "YES" : "NO");
   Serial.print("  Calibrated: "); Serial.println(isCalibrated ? "YES" : "NO");
-  Serial.print("  Windowing: "); Serial.println(enableWindowing ? "ENABLED" : "DISABLED");
   Serial.print("  Sequence Number: "); Serial.println(sequenceNumber);
   Serial.print("  Uptime: "); Serial.print(millis() / 1000); Serial.println(" seconds");
   Serial.println("========================================");
@@ -1562,3 +1422,6 @@ void handleSerialCommand() {
   }
 }
 #endif
+
+// Restore default struct packing
+#pragma pack(pop)
